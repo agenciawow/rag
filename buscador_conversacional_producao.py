@@ -8,6 +8,8 @@ import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from typing import List, Tuple, Optional, Dict, Any
+from collections import defaultdict
+from time import time
 from dotenv import load_dotenv
 
 import voyageai
@@ -82,6 +84,44 @@ logger.info("🚀 [INIT] Sistema de logging do RAG inicializado")
 def get_sao_paulo_time():
     """Retorna datetime atual no fuso horário de São Paulo"""
     return datetime.now(ZoneInfo("America/Sao_Paulo"))
+
+
+class RateLimiter:
+    """Controle simples de taxa de requisições"""
+
+    def __init__(self, max_requests: int = 10, window: int = 60) -> None:
+        self.max_requests = max_requests
+        self.window = window
+        self.requests: defaultdict[str, list[float]] = defaultdict(list)
+
+    def is_allowed(self, user_id: str) -> bool:
+        now = time()
+        user_requests = self.requests[user_id]
+        user_requests[:] = [t for t in user_requests if now - t < self.window]
+        if len(user_requests) >= self.max_requests:
+            return False
+        user_requests.append(now)
+        return True
+
+
+def validate_user_input(text: str) -> Tuple[bool, str]:
+    """Valida e sanitiza entrada do usuário"""
+    if not text or len(text.strip()) == 0:
+        return False, "Entrada vazia"
+    if len(text) > 5000:
+        return False, "Texto muito longo"
+    dangerous_chars = ['<', '>', '{', '}', '$', '\\']
+    if any(ch in text for ch in dangerous_chars):
+        return False, "Caracteres não permitidos"
+    return True, "OK"
+
+
+def safe_error_response(error: Exception, user_facing: bool = True) -> str:
+    """Retorna mensagem de erro segura e registra detalhes"""
+    logger.error(f"Erro interno: {error}", exc_info=True)
+    if user_facing:
+        return "Ocorreu um erro interno. Tente novamente."
+    return str(error)
 
 class ProductionQueryTransformer:
     """
@@ -405,10 +445,13 @@ class ProductionConversationalRAG:
         voyageai.api_key = os.environ["VOYAGE_API_KEY"]
         self.voyage_client = voyageai.Client()
         self.openai_client = OpenAI()
-        
+
         # Transformador otimizado
         self.query_transformer = ProductionQueryTransformer(self.openai_client)
-        
+
+        # Rate limiter global (pode ser customizado por usuário)
+        self.rate_limiter = RateLimiter()
+
         # Histórico da conversa
         self.chat_history: List[Dict[str, str]] = []
 
@@ -443,12 +486,20 @@ class ProductionConversationalRAG:
             logger.error(f"Falha ao conectar banco vetorial: {e}")
             raise
 
-    def ask(self, user_message: str) -> str:
+    def ask(self, user_message: str, user_id: str = "default") -> str:
         """Interface conversacional principal otimizada"""
-        import time
-        start_time = time.time()
+        start_time = time()
         logger.info(f"[ASK] === INICIANDO PROCESSAMENTO ===")
         logger.info(f"[ASK] Pergunta do usuário: {user_message}")
+
+        if not self.rate_limiter.is_allowed(user_id):
+            logger.warning(f"[RATE LIMIT] Usuário {user_id} excedeu limite")
+            return "Limite de requisições excedido. Tente novamente mais tarde."
+
+        valid, message = validate_user_input(user_message)
+        if not valid:
+            logger.warning(f"[VALIDATION] Entrada inválida: {message}")
+            return f"Entrada inválida: {message}"
         try:
             # Adiciona mensagem do usuário ao histórico
             self.chat_history.append({"role": "user", "content": user_message})
@@ -490,13 +541,13 @@ class ProductionConversationalRAG:
                 old_len = len(self.chat_history)
                 self.chat_history = self.chat_history[-16:]
                 logger.debug(f"[ASK] Histórico limitado: {old_len} -> {len(self.chat_history)} mensagens")
-            total_time = time.time() - start_time
+            total_time = time() - start_time
             logger.info(f"[ASK] ✅ === PROCESSAMENTO COMPLETO em {total_time:.2f}s ===")
             return response
         except Exception as e:
-            error_time = time.time() - start_time
+            error_time = time() - start_time
             logger.error(f"[ASK] ❌ Erro no processamento após {error_time:.2f}s: {e}", exc_info=True)
-            return "Desculpe, ocorreu um erro interno. Tente novamente."
+            return safe_error_response(e)
 
     def _generate_non_rag_response(self, user_message: str) -> str:
         """Gera resposta para mensagens que não precisam de RAG"""
@@ -541,8 +592,16 @@ class ProductionConversationalRAG:
     def search_candidates(self, query_embedding: List[float], limit: int = MAX_CANDIDATES) -> List[dict]:
         """Busca candidatos no Astra DB"""
         try:
+            # Validação básica de entrada
+            if not isinstance(query_embedding, list) or not all(isinstance(v, (int, float)) for v in query_embedding):
+                logger.warning("[SEARCH] query_embedding inválido")
+                return []
+
+            limit = int(limit) if isinstance(limit, int) and limit > 0 else MAX_CANDIDATES
+            limit = min(limit, MAX_CANDIDATES)
+
             logger.debug(f"[SEARCH] Buscando similaridade no Astra DB com limite de {limit}...")
-            
+
             cursor = self.collection.find(
                 {},
                 sort={"$vector": query_embedding},
@@ -741,8 +800,7 @@ class ProductionConversationalRAG:
             return response.choices[0].message.content
             
         except Exception as e:
-            logger.error(f"Erro gerando resposta: {e}")
-            return f"Erro ao processar resposta: {e}"
+            return safe_error_response(e)
 
     def search_and_answer(self, query: str) -> dict:
         """Pipeline completo RAG"""
@@ -761,8 +819,7 @@ class ProductionConversationalRAG:
             embedding_time = time.time() - embedding_start
             logger.info(f"[RAG] ✅ Embedding gerado em {embedding_time:.2f}s (dimensão: {len(embedding)})")
         except Exception as e:
-            logger.error(f"[RAG] ❌ Embedding falhou: {e}")
-            return {"error": f"Embedding falhou: {e}"}
+            return {"error": safe_error_response(e)}
 
         # ETAPA 2: Buscar candidatos
         logger.info(f"[RAG] 🔍 ETAPA 2: Buscando candidatos no Astra DB...")
@@ -937,10 +994,9 @@ DOCUMENTOS:"""
             }
             
         except Exception as e:
-            logger.error(f"Erro na extração de dados: {e}")
             return {
                 "status": "error",
-                "message": f"Erro na extração: {e}"
+                "message": safe_error_response(e)
             }
 
     def clear_history(self):
@@ -1132,7 +1188,7 @@ def health_check() -> Dict[str, str]:
     except Exception as e:
         return {
             "status": "error",
-            "error": str(e),
+            "error": safe_error_response(e),
             "timestamp": get_sao_paulo_time().isoformat()
         }
 

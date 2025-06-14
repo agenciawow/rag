@@ -19,7 +19,13 @@ from logging.handlers import RotatingFileHandler
 from dotenv import load_dotenv
 
 # Importa a versão do sistema
-from buscador_conversacional_producao import ProductionConversationalRAG, ProductionQueryTransformer, health_check, test_apis
+from buscador_conversacional_producao import (
+    ProductionConversationalRAG,
+    ProductionQueryTransformer,
+    health_check,
+    test_apis,
+    safe_error_response,
+)
 
 # Configuração da página (com proteção contra re-execução)
 try:
@@ -680,7 +686,7 @@ class ProductionStreamlitRAG:
             
             # Usa o método ask do sistema
             logger.debug(f"[ASK] Chamando RAG...")
-            response = st.session_state.rag_instance.ask(question)
+            response = st.session_state.rag_instance.ask(question, self.user_id)
             
             processing_time = time.time() - start_time
             logger.info(f"[ASK] Resposta gerada em {processing_time:.2f}s")
@@ -709,8 +715,11 @@ class ProductionStreamlitRAG:
             
         except Exception as e:
             error_time = time.time() - start_time
-            logger.error(f"[ASK] Erro na pergunta do usuário {self.user_id} após {error_time:.2f}s: {e}", exc_info=True)
-            return f"❌ Erro ao processar pergunta: {e}"
+            logger.error(
+                f"[ASK] Erro na pergunta do usuário {self.user_id} após {error_time:.2f}s: {e}",
+                exc_info=True,
+            )
+            return safe_error_response(e)
     
     def ask_question_only(self, question: str) -> str:
         """Faz pergunta usando RAG retornando apenas a resposta, sem gerenciar histórico"""
@@ -785,8 +794,11 @@ class ProductionStreamlitRAG:
             
         except Exception as e:
             error_time = time.time() - start_time
-            logger.error(f"[ASK_ONLY] Erro na pergunta do usuário {self.user_id} após {error_time:.2f}s: {e}", exc_info=True)
-            return f"❌ Erro ao processar pergunta: {e}"
+            logger.error(
+                f"[ASK_ONLY] Erro na pergunta do usuário {self.user_id} após {error_time:.2f}s: {e}",
+                exc_info=True,
+            )
+            return safe_error_response(e)
     
     def _clean_rag_response(self, response: str) -> str:
         """Remove mensagens de status e indicadores de tempo da resposta"""
@@ -2078,12 +2090,16 @@ def chat_interface():
                             
                     except Exception as e:
                         error_time = time.time() - start_time
-                        error_msg = f"❌ Erro ao processar pergunta: {e}"
-                        logger.error(f"[CHAT] Erro no chat para {st.session_state.username} após {error_time:.2f}s: {e}", exc_info=True)
-                        
+                        logger.error(
+                            f"[CHAT] Erro no chat para {st.session_state.username} após {error_time:.2f}s: {e}",
+                            exc_info=True,
+                        )
+
+                        error_msg = safe_error_response(e)
+
                         # Exibe erro
                         st.markdown(error_msg)
-                        
+
                         # Adiciona mensagem de erro ao histórico
                         error_message = {"role": "assistant", "content": error_msg}
                         st.session_state.messages.append(error_message)
