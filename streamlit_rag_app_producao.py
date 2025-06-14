@@ -33,6 +33,53 @@ except st.errors.StreamlitAPIException:
     # Página já configurada, ignora
     pass
 
+# CSS para ocultar links âncora dos headers
+st.markdown("""
+<style>
+.stMarkdown h1 a, 
+.stMarkdown h2 a, 
+.stMarkdown h3 a, 
+.stMarkdown h4 a, 
+.stMarkdown h5 a, 
+.stMarkdown h6 a {
+    display: none !important;
+}
+
+/* Remove links âncora dos headers gerados por st.header, st.subheader */
+[data-testid="stMarkdownContainer"] h1 a,
+[data-testid="stMarkdownContainer"] h2 a,
+[data-testid="stMarkdownContainer"] h3 a,
+[data-testid="stMarkdownContainer"] h4 a,
+[data-testid="stMarkdownContainer"] h5 a,
+[data-testid="stMarkdownContainer"] h6 a {
+    display: none !important;
+}
+
+/* Remove ícone de link dos headers */
+.stMarkdown .anchor-link,
+[data-testid="stMarkdownContainer"] .anchor-link {
+    display: none !important;
+}
+
+/* Oculta painel de desenvolvimento/settings */
+[data-testid="stSidebar"] [data-testid="stExpander"]:has([data-testid="stExpanderToggleIcon"]) {
+    display: none !important;
+}
+
+/* Oculta seção "Settings Development" */
+.stExpander:has(.streamlit-expander-header:contains("Settings")) {
+    display: none !important;
+}
+
+/* Oculta botão "Run on save" e painel de desenvolvimento */
+[data-testid="stToolbar"],
+.st-emotion-cache-1wmy9hl,
+.streamlit-wide .main .block-container .stButton button[kind="secondary"]:contains("Run on save") {
+    display: none !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
 def clean_old_logs():
     """Limpa logs antigos para economizar espaço"""
     try:
@@ -840,12 +887,6 @@ def login_page():
     csrf_token = generate_csrf_token()
     
     with st.form("login_form"):
-        st.markdown("📊 **Políticas de Segurança:**")
-        st.markdown("- Senhas devem ter pelo menos 8 caracteres")
-        st.markdown("- Incluir maiúsculas, minúsculas e números")
-        st.markdown("- Máximo 5 tentativas por minuto")
-        st.markdown("- Sessão expira em 8 horas")
-        st.markdown("---")
         
         username = st.text_input(
             "👤 Usuário", 
@@ -861,14 +902,14 @@ def login_page():
             help="Senha do usuário"
         )
         
-        # Token CSRF oculto
-        st.text_input("csrf_token", value=csrf_token, type="password", key="hidden_csrf", label_visibility="hidden")
+        # Token CSRF armazenado no session state (não visível)
+        st.session_state.csrf_token = csrf_token
         
         login_button = st.form_submit_button("🚀 Entrar", use_container_width=True)
     
     if login_button:
         # Valida CSRF token
-        submitted_csrf = st.session_state.get('hidden_csrf', '')
+        submitted_csrf = st.session_state.get('csrf_token', '')
         if not hmac.compare_digest(submitted_csrf, csrf_token):
             st.error("❌ Token de segurança inválido")
             logger.warning("[SECURITY] Token CSRF inválido")
@@ -1378,7 +1419,7 @@ def document_management_modal():
                                 
                                 # Garante que todas as variáveis do Astra DB estão presentes
                                 required_env_vars = [
-                                    'VOYAGE_API_KEY', 'ASTRA_DB_API_ENDPOINT', 'ASTRA_DB_APPLICATION_TOKEN'
+                                    'VOYAGE_API_KEY', 'VECTOR_DB_API_ENDPOINT', 'VECTOR_DB_TOKEN'
                                 ]
                                 missing_vars = [var for var in required_env_vars if not env.get(var)]
                                 if missing_vars:
@@ -1454,7 +1495,7 @@ def document_management_modal():
                             
                             # Garante que todas as variáveis do Astra DB estão presentes
                             required_env_vars = [
-                                'VOYAGE_API_KEY', 'ASTRA_DB_API_ENDPOINT', 'ASTRA_DB_APPLICATION_TOKEN'
+                                'VOYAGE_API_KEY', 'VECTOR_DB_API_ENDPOINT', 'VECTOR_DB_TOKEN'
                             ]
                             missing_vars = [var for var in required_env_vars if not env.get(var)]
                             if missing_vars:
@@ -1560,12 +1601,12 @@ def document_management_modal():
             try:
                 # Busca documentos reais no Astra DB
                 from astrapy import DataAPIClient
-                endpoint = os.getenv("ASTRA_DB_API_ENDPOINT")
-                token = os.getenv("ASTRA_DB_APPLICATION_TOKEN")
+                endpoint = os.getenv("VECTOR_DB_API_ENDPOINT")
+                token = os.getenv("VECTOR_DB_TOKEN")
                 
                 if endpoint and token:
                     client = DataAPIClient(token)
-                    database = client.get_database(endpoint)
+                    database = client.get_database_by_api_endpoint(endpoint)
                     collection = database.get_collection("pdf_documents")
                     
                     # Busca documentos únicos pela fonte
@@ -1608,40 +1649,38 @@ def document_management_modal():
                                         # Modo de confirmação
                                         st.warning("⚠️ Clique novamente para confirmar a remoção.")
                                         
-                                        col_confirm, col_cancel = st.columns(2)
-                                        with col_confirm:
-                                            if st.button("✅ Confirmar", key=f"confirm_{delete_key}", use_container_width=True):
-                                                try:
-                                                    # Remove todos os chunks relacionados ao documento
-                                                    result = collection.delete_many({"doc_source": doc_source})
-                                                    
-                                                    # Remove imagens relacionadas
-                                                    import glob
-                                                    pdf_images_dir = "pdf_images"
-                                                    if os.path.exists(pdf_images_dir):
-                                                        doc_base_name = doc_name.replace(".pdf", "").replace(" ", "_")
-                                                        for img_file in glob.glob(f"{pdf_images_dir}/*{doc_base_name}*"):
-                                                            try:
-                                                                os.remove(img_file)
-                                                            except:
-                                                                pass
-                                                    
-                                                    st.success(f"✅ Documento '{doc_name}' removido! {result.deleted_count} chunks excluídos.")
-                                                    # Limpa o estado de confirmação
-                                                    st.session_state[confirm_key] = False
-                                                    # Aguarda um pouco para que o usuário veja a mensagem
-                                                    time.sleep(2)
-                                                    st.rerun()
-                                                    
-                                                except Exception as e:
-                                                    st.error(f"❌ Erro ao remover documento: {str(e)}")
-                                                    st.session_state[confirm_key] = False
-                                        
-                                        with col_cancel:
-                                            if st.button("❌ Cancelar", key=cancel_key, use_container_width=True):
+                                        # Botões em layout vertical (um em cima do outro)
+                                        if st.button("✅ Confirmar", key=f"confirm_{delete_key}", use_container_width=True):
+                                            try:
+                                                # Remove todos os chunks relacionados ao documento
+                                                result = collection.delete_many({"doc_source": doc_source})
+                                                
+                                                # Remove imagens relacionadas
+                                                import glob
+                                                pdf_images_dir = "pdf_images"
+                                                if os.path.exists(pdf_images_dir):
+                                                    doc_base_name = doc_name.replace(".pdf", "").replace(" ", "_")
+                                                    for img_file in glob.glob(f"{pdf_images_dir}/*{doc_base_name}*"):
+                                                        try:
+                                                            os.remove(img_file)
+                                                        except:
+                                                            pass
+                                                
+                                                st.success(f"✅ Documento '{doc_name}' removido! {result.deleted_count} chunks excluídos.")
                                                 # Limpa o estado de confirmação
                                                 st.session_state[confirm_key] = False
+                                                # Aguarda um pouco para que o usuário veja a mensagem
+                                                time.sleep(2)
                                                 st.rerun()
+                                                
+                                            except Exception as e:
+                                                st.error(f"❌ Erro ao remover documento: {str(e)}")
+                                                st.session_state[confirm_key] = False
+                                        
+                                        if st.button("❌ Cancelar", key=cancel_key, use_container_width=True):
+                                            # Limpa o estado de confirmação
+                                            st.session_state[confirm_key] = False
+                                            st.rerun()
                     else:
                         st.info("📄 Nenhum documento indexado encontrado.")
                 else:
@@ -1653,14 +1692,14 @@ def document_management_modal():
         with tabs[2]:  # Configurações do Banco
             st.markdown("#### ⚙️ Configurações de Conexão com o Banco de Dados")
             with st.form("db_config_form"):
-                current_endpoint = os.getenv("ASTRA_DB_API_ENDPOINT", "")
+                current_endpoint = os.getenv("VECTOR_DB_API_ENDPOINT", "")
                 new_endpoint = st.text_input(
                     "Endpoint do Astra DB:",
                     value=current_endpoint,
                     help="URL do endpoint do Astra DB (ex: https://db-id.us-east-1.apps.astra.datastax.com)",
                     key="db_endpoint_input"
                 )
-                current_token = os.getenv("ASTRA_DB_APPLICATION_TOKEN", "")
+                current_token = os.getenv("VECTOR_DB_TOKEN", "")
                 new_token = st.text_input(
                     "Token de Aplicação:",
                     value=current_token,
@@ -1671,10 +1710,10 @@ def document_management_modal():
                 if st.form_submit_button("💾 Salvar Configurações", use_container_width=True):
                     try:
                         if new_endpoint != current_endpoint:
-                            set_env_var("ASTRA_DB_API_ENDPOINT", new_endpoint)
+                            set_env_var("VECTOR_DB_API_ENDPOINT", new_endpoint)
                             logger.info(f"[CONFIG] Endpoint do Astra DB atualizado")
                         if new_token != current_token:
-                            set_env_var("ASTRA_DB_APPLICATION_TOKEN", new_token)
+                            set_env_var("VECTOR_DB_TOKEN", new_token)
                             logger.info("[CONFIG] Token do Astra DB atualizado")
                         st.success("✅ Configurações salvas!")
                     except Exception as e:
@@ -1683,13 +1722,13 @@ def document_management_modal():
             if st.button("🔗 Testar Conexão", use_container_width=True):
                 try:
                     from astrapy import DataAPIClient
-                    endpoint = os.getenv("ASTRA_DB_API_ENDPOINT")
-                    token = os.getenv("ASTRA_DB_APPLICATION_TOKEN")
+                    endpoint = os.getenv("VECTOR_DB_API_ENDPOINT")
+                    token = os.getenv("VECTOR_DB_TOKEN")
                     if not endpoint or not token:
                         st.warning("⚠️ Configure o endpoint e token primeiro")
                     else:
-                        client = DataAPIClient()
-                        database = client.get_database(endpoint, token=token)
+                        client = DataAPIClient(token)
+                        database = client.get_database_by_api_endpoint(endpoint)
                         collection = database.get_collection("pdf_documents")
                         list(collection.find({}, limit=1))
                         st.success("✅ Conexão com Astra DB estabelecida!")
@@ -1923,7 +1962,7 @@ def chat_interface():
         Faça sua primeira pergunta!
         """)
     
-    # Exibe histórico existente
+    # Exibe histórico existente (exceto mensagens sendo processadas)
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
@@ -1933,7 +1972,7 @@ def chat_interface():
         username = getattr(st.session_state, 'username', 'unknown')
         logger.info(f"[CHAT] Nova mensagem do usuário {username}: {prompt[:100]}...")
         
-        # PASSO 1: Adiciona pergunta do usuário
+        # PASSO 1: Adiciona pergunta do usuário ao histórico
         user_message = {"role": "user", "content": prompt}
         st.session_state.messages.append(user_message)
         
@@ -1941,32 +1980,23 @@ def chat_interface():
         if hasattr(st.session_state.rag_instance, 'chat_history'):
             st.session_state.rag_instance.chat_history.append(user_message)
         
-        # Exibe pergunta do usuário
-        with st.chat_message("user"):
-            st.markdown(prompt)
-        
         # PASSO 2: Processa resposta
-        with st.chat_message("assistant"):
-            start_time = time.time()
-            try:
-                with st.spinner("🧠 Processando com IA...", show_time=True):
-                    # Usa o método que não duplica histórico
-                    resposta = st.session_state.user_rag.ask_question_only(prompt)
-                
-                processing_time = time.time() - start_time
-                logger.info(f"[CHAT] Resposta processada em {processing_time:.2f}s para {st.session_state.username}")
-                logger.debug(f"[CHAT] Resposta: {resposta[:200]}...")
-                
-                # Exibe resposta
-                st.markdown(resposta)
-                
-                # PASSO 3: Adiciona resposta ao histórico
-                assistant_message = {"role": "assistant", "content": resposta}
-                st.session_state.messages.append(assistant_message)
-                
-                # Adiciona ao backend
-                if hasattr(st.session_state.rag_instance, 'chat_history'):
-                    st.session_state.rag_instance.chat_history.append(assistant_message)
+        start_time = time.time()
+        try:
+            # Usa o método que não duplica histórico
+            resposta = st.session_state.user_rag.ask_question_only(prompt)
+            
+            processing_time = time.time() - start_time
+            logger.info(f"[CHAT] Resposta processada em {processing_time:.2f}s para {st.session_state.username}")
+            logger.debug(f"[CHAT] Resposta: {resposta[:200]}...")
+            
+            # PASSO 3: Adiciona resposta ao histórico
+            assistant_message = {"role": "assistant", "content": resposta}
+            st.session_state.messages.append(assistant_message)
+            
+            # Adiciona ao backend
+            if hasattr(st.session_state.rag_instance, 'chat_history'):
+                st.session_state.rag_instance.chat_history.append(assistant_message)
                 
                 # PASSO 4: Salva histórico (apenas uma vez)
                 try:
@@ -1975,30 +2005,20 @@ def chat_interface():
                 except Exception as save_error:
                     logger.error(f"[CHAT] Erro ao salvar histórico: {save_error}")
                 
-                # Mostra tempo para admins
-                if st.session_state.user_info.get('role') == 'Admin':
-                    st.caption(f"⏱️ Processado em {processing_time:.2f}s")
+                # Recarrega a página para mostrar as mensagens sem duplicação
+                st.rerun()
                     
-            except Exception as e:
-                error_time = time.time() - start_time
-                error_msg = f"❌ Erro ao processar pergunta: {e}"
-                logger.error(f"[CHAT] Erro no chat para {st.session_state.username} após {error_time:.2f}s: {e}", exc_info=True)
-                
-                # Exibe erro
-                st.error(error_msg)
-                
-                # Adiciona erro ao histórico
-                error_message = {"role": "assistant", "content": error_msg}
-                st.session_state.messages.append(error_message)
-                
-                if hasattr(st.session_state.rag_instance, 'chat_history'):
-                    st.session_state.rag_instance.chat_history.append(error_message)
-                
-                # Salva histórico mesmo com erro
-                try:
-                    st.session_state.user_rag.save_user_history()
-                except Exception as save_error:
-                    logger.error(f"[CHAT] Erro ao salvar histórico de erro: {save_error}")
+        except Exception as e:
+            error_time = time.time() - start_time
+            error_msg = f"❌ Erro ao processar pergunta: {e}"
+            logger.error(f"[CHAT] Erro no chat para {st.session_state.username} após {error_time:.2f}s: {e}", exc_info=True)
+            
+            # Adiciona mensagem de erro ao histórico
+            error_message = {"role": "assistant", "content": error_msg}
+            st.session_state.messages.append(error_message)
+            
+            # Recarrega a página
+            st.rerun()
 
 def main():
     """Função principal da aplicação"""

@@ -1,0 +1,24 @@
+[global]
+# Remove menu de desenvolvimento
+developmentMode = false
+
+[server]
+# Remove botão "Run on save"
+runOnSave = false
+
+[client]
+# Remove toolbar de desenvolvimento
+toolbarMode = "minimal"
+
+[ui]
+# Oculta elementos de desenvolvimento
+hideTopBar = false
+hideSidebarNav = false
+
+[runner]
+# Desabilita fast rerun para produção
+fastReruns = false
+
+[browser]
+# Remove indicador de desenvolvimento
+gatherUsageStats = false

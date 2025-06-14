@@ -392,10 +392,10 @@ class ProductionConversationalRAG:
         """Inicializa com configurações do sistema"""
         load_dotenv()
 
-        # Validação de ambiente
+        # Validação de ambiente - apenas variáveis essenciais
         required_vars = [
             "VOYAGE_API_KEY", "OPENAI_API_KEY",
-            "ASTRA_DB_API_ENDPOINT", "ASTRA_DB_APPLICATION_TOKEN"
+            "VECTOR_DB_API_ENDPOINT", "VECTOR_DB_TOKEN"
         ]
         missing_vars = [var for var in required_vars if not os.getenv(var)]
         if missing_vars:
@@ -418,22 +418,29 @@ class ProductionConversationalRAG:
         logger.info("Sistema RAG inicializado com sucesso")
 
     def _initialize_database(self):
-        """Inicializa conexão com base de dados"""
+        """Inicializa conexão com o banco vetorial"""
         try:
-            logger.info("Conectando ao Astra DB...")
-            client = DataAPIClient()
-            database = client.get_database(
-                os.environ["ASTRA_DB_API_ENDPOINT"], 
-                token=os.environ["ASTRA_DB_APPLICATION_TOKEN"]
+            logger.info("Conectando ao banco vetorial...")
+            
+            # Banco vetorial para embeddings dos documentos
+            vector_client = DataAPIClient(os.environ["VECTOR_DB_TOKEN"])
+            vector_db = vector_client.get_database_by_api_endpoint(
+                os.environ["VECTOR_DB_API_ENDPOINT"]
             )
-            self.collection = database.get_collection(COLLECTION_NAME)
+            self.collection = vector_db.get_collection(COLLECTION_NAME)
+            
+            # Usuários e memórias são gerenciados localmente
+            logger.info("Usuários: gerenciados localmente (production_users.json)")
             
             # Teste de conectividade
-            list(self.collection.find({}, limit=1))
-            logger.info(f"Conectado ao Astra DB - Collection '{COLLECTION_NAME}' acessível")
+            try:
+                count = self.collection.estimated_document_count()
+                logger.info(f"Banco vetorial conectado - Collection '{COLLECTION_NAME}' com {count} documentos")
+            except Exception as test_error:
+                logger.warning(f"Teste de conectividade do banco vetorial falhou: {test_error}")
                 
         except Exception as e:
-            logger.error(f"Falha ao conectar Astra DB: {e}")
+            logger.error(f"Falha ao conectar banco vetorial: {e}")
             raise
 
     def ask(self, user_message: str) -> str:

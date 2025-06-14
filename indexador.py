@@ -110,8 +110,8 @@ def validate_env_vars() -> None:
     """Valida se todas as variáveis de ambiente necessárias estão definidas"""
     required_vars = [
         "VOYAGE_API_KEY",
-        "ASTRA_DB_API_ENDPOINT", 
-        "ASTRA_DB_APPLICATION_TOKEN"
+        "VECTOR_DB_API_ENDPOINT", 
+        "VECTOR_DB_TOKEN"
     ]
     
     missing_vars = [var for var in required_vars if not os.getenv(var)]
@@ -124,15 +124,15 @@ def validate_env_vars() -> None:
 def connect_to_astra(config: Config) -> Collection:
     """Conecta ao Astra DB e retorna a collection"""
     try:
-        endpoint = os.getenv("ASTRA_DB_API_ENDPOINT")
-        token = os.getenv("ASTRA_DB_APPLICATION_TOKEN")
+        endpoint = os.getenv("VECTOR_DB_API_ENDPOINT")
+        token = os.getenv("VECTOR_DB_TOKEN")
         
         if not endpoint or not token:
-            raise RuntimeError("Variáveis ASTRA_DB_API_ENDPOINT e ASTRA_DB_APPLICATION_TOKEN devem estar definidas")
+            raise RuntimeError("Variáveis VECTOR_DB_API_ENDPOINT e VECTOR_DB_TOKEN devem estar definidas")
         
-        # Criar cliente e conectar ao database
-        client = DataAPIClient()
-        database = client.get_database(endpoint, token=token)
+        # Criar cliente e conectar ao database vetorial
+        client = DataAPIClient(token)
+        database = client.get_database_by_api_endpoint(endpoint)
         
         logger.info(f"Conectado ao database {database.info().name}")
         
