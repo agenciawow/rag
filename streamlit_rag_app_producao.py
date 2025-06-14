@@ -680,7 +680,7 @@ class ProductionStreamlitRAG:
             
             # Usa o método ask do sistema
             logger.debug(f"[ASK] Chamando RAG...")
-            response = st.session_state.rag_instance.ask(question)
+            response = st.session_state.rag_instance.ask(question, self.user_id)
             
             processing_time = time.time() - start_time
             logger.info(f"[ASK] Resposta gerada em {processing_time:.2f}s")
