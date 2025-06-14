@@ -25,9 +25,23 @@ COLLECTION_NAME = "pdf_documents"
 
 # Configuração de logging específica para o buscador
 def setup_rag_logging():
-    """Configura logging específico para o RAG"""
+    """Configura logging específico para o RAG com rotação automática"""
+    from logging.handlers import RotatingFileHandler
+    import os
+    
+    # Rotaciona log se estiver muito grande
+    log_file = "rag_production_debug.log"
+    if os.path.exists(log_file):
+        file_size = os.path.getsize(log_file) / (1024 * 1024)  # MB
+        if file_size > 100:  # Se maior que 100MB
+            import shutil
+            from datetime import datetime
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_name = f"{log_file}.{timestamp}.bak"
+            shutil.move(log_file, backup_name)
+    
     rag_logger = logging.getLogger(__name__)
-    rag_logger.setLevel(logging.DEBUG)
+    rag_logger.setLevel(logging.INFO)  # Mudado de DEBUG para INFO
     
     # Remove handlers existentes para evitar duplicação
     for handler in rag_logger.handlers[:]:
@@ -38,15 +52,20 @@ def setup_rag_logging():
         "%(asctime)s - %(name)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s"
     )
     
-    # Handler para console
+    # Handler para console (apenas WARNING e acima)
     console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.DEBUG)
+    console_handler.setLevel(logging.WARNING)
     console_handler.setFormatter(formatter)
     rag_logger.addHandler(console_handler)
     
-    # Handler para arquivo específico do RAG
-    file_handler = logging.FileHandler("rag_production_debug.log", encoding='utf-8')
-    file_handler.setLevel(logging.DEBUG)
+    # Handler rotativo para arquivo do RAG (máximo 50MB, 5 backups)
+    file_handler = RotatingFileHandler(
+        "rag_production_debug.log",
+        maxBytes=50*1024*1024,  # 50MB
+        backupCount=5,
+        encoding='utf-8'
+    )
+    file_handler.setLevel(logging.INFO)
     file_handler.setFormatter(formatter)
     rag_logger.addHandler(file_handler)
     

@@ -12,12 +12,12 @@
     "active": true,
     "notes": ""
   },
-  "teste": {
-    "password_hash": "9471deee03fc10d8a61ccb03a6b1d9e4b670e6c57323bb7d54ac13b4f1a46a7a",
+  "testuser": {
+    "password_hash": "pbkdf2_sha256$100000$c813664be1f7df9d4842e522a6886b8d1716df246853d306088d5d0e6b046195$312dcd2611fa0738cf4cf3cf3034a6657c29a8f679726d95973f038dfa29e171",
     "name": "Usuário Teste",
     "role": "Usuário",
-    "organization": "Empresa Teste",
-    "created_at": "2025-06-13T17:30:29.014788-03:00",
+    "organization": "Teste Org",
+    "created_at": "2025-06-14T00:17:06.659881-03:00",
     "last_login": "",
     "total_conversations": 0,
     "successful_queries": 0,

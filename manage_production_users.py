@@ -2,6 +2,8 @@
 
 import json
 import hashlib
+import secrets
+import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from pathlib import Path
@@ -49,9 +51,43 @@ class ProductionUserManager:
             print(f"❌ Erro ao salvar usuários: {e}")
             return False
     
+    def _validate_password_strength(self, password: str) -> tuple[bool, str]:
+        """Valida força da senha"""
+        if len(password) < 8:
+            return False, "Senha deve ter pelo menos 8 caracteres"
+        
+        if not re.search(r'[A-Z]', password):
+            return False, "Senha deve conter pelo menos uma letra maiúscula"
+        
+        if not re.search(r'[a-z]', password):
+            return False, "Senha deve conter pelo menos uma letra minúscula"
+        
+        if not re.search(r'\d', password):
+            return False, "Senha deve conter pelo menos um número"
+        
+        # Verifica senhas comuns
+        weak_passwords = [
+            'password', '123456', '12345678', 'admin', 'qwerty',
+            'password123', 'admin123', '123456789', 'senha123'
+        ]
+        if password.lower() in weak_passwords:
+            return False, "Senha muito comum, escolha outra"
+        
+        return True, "Senha válida"
+    
     def hash_password(self, password: str) -> str:
-        """Cria hash da senha com salt"""
-        return hashlib.sha256((password + self.salt).encode()).hexdigest()
+        """Cria hash seguro da senha com salt aleatório"""
+        # Gera salt aleatório
+        salt = secrets.token_hex(32)
+        
+        # PBKDF2 com 100.000 iterações
+        password_hash = hashlib.pbkdf2_hmac(
+            'sha256',
+            password.encode('utf-8'),
+            salt.encode('utf-8'),
+            100000
+        )
+        return f"pbkdf2_sha256$100000${salt}${password_hash.hex()}"
     
     def add_user(self, username: str, name: str, password: str, role: str = "Usuário", 
                  organization: str = ""):
@@ -62,8 +98,10 @@ class ProductionUserManager:
         if len(username) < 3:
             return False, "Nome de usuário deve ter pelo menos 3 caracteres!"
         
-        if len(password) < 4:
-            return False, "Senha deve ter pelo menos 4 caracteres!"
+        # Valida força da senha
+        is_valid, message = self._validate_password_strength(password)
+        if not is_valid:
+            return False, message
         
         # Valida role
         if role not in self.available_roles:

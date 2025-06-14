@@ -6,30 +6,70 @@ import hashlib
 import logging
 import os
 import time
-from datetime import datetime
+import shutil
+import secrets
+import hmac
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, Any, Optional, List
 from zoneinfo import ZoneInfo
 import re
 import tempfile
+from logging.handlers import RotatingFileHandler
 from dotenv import load_dotenv
 
 # Importa a versão do sistema
-from buscador_conversacional_producao import ProductionConversationalRAG, health_check, test_apis
+from buscador_conversacional_producao import ProductionConversationalRAG, ProductionQueryTransformer, health_check, test_apis
 
-# Configuração da página
-st.set_page_config(
-    page_title="RAG Conversacional",
-    page_icon="🚀",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+# Configuração da página (com proteção contra re-execução)
+try:
+    st.set_page_config(
+        page_title="RAG Conversacional",
+        page_icon="🚀",
+        layout="wide",
+        initial_sidebar_state="expanded"
+    )
+except st.errors.StreamlitAPIException:
+    # Página já configurada, ignora
+    pass
+
+def clean_old_logs():
+    """Limpa logs antigos para economizar espaço"""
+    try:
+        log_files = [
+            "streamlit_debug.log",
+            "rag_production_debug.log"
+        ]
+        
+        for log_file in log_files:
+            if os.path.exists(log_file):
+                # Se arquivo for maior que 50MB, rotaciona
+                file_size = os.path.getsize(log_file) / (1024 * 1024)  # MB
+                if file_size > 50:
+                    # Cria backup com timestamp
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    backup_name = f"{log_file}.{timestamp}.bak"
+                    shutil.move(log_file, backup_name)
+                    
+                    # Remove backups muito antigos (mais de 7 dias)
+                    pattern = f"{log_file}.*.bak"
+                    for old_backup in Path(".").glob(pattern):
+                        # Verifica idade do arquivo
+                        file_time = datetime.fromtimestamp(old_backup.stat().st_mtime)
+                        if datetime.now() - file_time > timedelta(days=7):
+                            old_backup.unlink()
+                            
+    except Exception as e:
+        print(f"Erro na limpeza de logs: {e}")
 
 # Configuração de logging específica para o Streamlit
 def setup_streamlit_logging():
-    """Configura logging específico para o Streamlit"""
+    """Configura logging específico para o Streamlit com rotação automática"""
+    # Limpa logs antigos primeiro
+    clean_old_logs()
+    
     st_logger = logging.getLogger(__name__)
-    st_logger.setLevel(logging.DEBUG)
+    st_logger.setLevel(logging.INFO)  # Reduzido de DEBUG para INFO
     
     # Remove handlers existentes para evitar duplicação
     for handler in st_logger.handlers[:]:
@@ -42,18 +82,23 @@ def setup_streamlit_logging():
     
     # Handler para console
     console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.INFO)  # Menos verboso no console para Streamlit
+    console_handler.setLevel(logging.WARNING)  # Apenas warnings no console
     console_handler.setFormatter(formatter)
     st_logger.addHandler(console_handler)
     
-    # Handler para arquivo específico do Streamlit
-    file_handler = logging.FileHandler("streamlit_debug.log", encoding='utf-8')
-    file_handler.setLevel(logging.DEBUG)
+    # Handler rotativo para arquivo do Streamlit (máximo 10MB, 3 backups)
+    file_handler = RotatingFileHandler(
+        "streamlit_debug.log", 
+        maxBytes=10*1024*1024,  # 10MB
+        backupCount=3,
+        encoding='utf-8'
+    )
+    file_handler.setLevel(logging.INFO)
     file_handler.setFormatter(formatter)
     st_logger.addHandler(file_handler)
     
-    # Permite propagação para mostrar logs no console principal
-    st_logger.propagate = True
+    # Não propaga para evitar duplicação
+    st_logger.propagate = False
     
     return st_logger
 
@@ -65,6 +110,43 @@ logger.info("🌐 [INIT] Sistema de logging do Streamlit inicializado")
 def get_sao_paulo_time():
     """Retorna datetime atual no fuso horário de São Paulo"""
     return datetime.now(ZoneInfo("America/Sao_Paulo"))
+
+def check_session_timeout():
+    """Verifica e limpa sessões expiradas"""
+    if 'authenticated' in st.session_state and st.session_state.authenticated:
+        # Verifica se existe timestamp de login
+        if 'login_time' not in st.session_state:
+            st.session_state.login_time = get_sao_paulo_time()
+        
+        # Sessão expira em 8 horas
+        session_duration = get_sao_paulo_time() - st.session_state.login_time
+        if session_duration > timedelta(hours=8):
+            logger.warning(f"[SECURITY] Sessão expirada para {getattr(st.session_state, 'username', 'unknown')[:3]}***")
+            clear_session()
+            st.error("⚠️ Sessão expirada. Faça login novamente.")
+            st.rerun()
+            return False
+        
+        # Atualiza atividade
+        st.session_state.last_activity = get_sao_paulo_time()
+    return True
+
+def clear_session():
+    """Limpa sessão de forma segura"""
+    sensitive_keys = [
+        'authenticated', 'username', 'user_info', 'user_manager', 
+        'user_rag', 'login_time', 'last_activity', 'messages'
+    ]
+    
+    for key in sensitive_keys:
+        if key in st.session_state:
+            del st.session_state[key]
+
+def generate_csrf_token() -> str:
+    """Gera token CSRF para proteção"""
+    if 'csrf_token' not in st.session_state:
+        st.session_state.csrf_token = secrets.token_urlsafe(32)
+    return st.session_state.csrf_token
 
 def close_all_modals():
     """Fecha todos os modals abertos"""
@@ -107,16 +189,134 @@ class StreamlitUserManager:
         except Exception as e:
             logger.error(f"Erro ao salvar usuários: {e}")
     
+    def _generate_salt(self) -> str:
+        """Gera salt aleatório seguro"""
+        return secrets.token_hex(32)
+    
+    def _hash_password_secure(self, password: str, salt: str = None) -> tuple[str, str]:
+        """Hash seguro da senha com salt aleatório e iterações"""
+        if salt is None:
+            salt = self._generate_salt()
+        
+        # PBKDF2 com 100.000 iterações (padrão recomendado)
+        import hashlib
+        password_hash = hashlib.pbkdf2_hmac(
+            'sha256',
+            password.encode('utf-8'),
+            salt.encode('utf-8'),
+            100000  # iterações
+        )
+        return password_hash.hex(), salt
+    
     def hash_password(self, password: str) -> str:
-        """Hash da senha com salt"""
+        """Hash da senha com salt (mantido para compatibilidade)"""
+        # Para novos usuários, usa o método seguro
+        password_hash, salt = self._hash_password_secure(password)
+        return f"pbkdf2_sha256$100000${salt}${password_hash}"
+    
+    def _verify_legacy_password(self, password: str, stored_hash: str) -> bool:
+        """Verifica senhas no formato antigo (legacy)"""
         salt = "streamlit_rag_production_2025"
-        return hashlib.sha256((password + salt).encode()).hexdigest()
+        legacy_hash = hashlib.sha256((password + salt).encode()).hexdigest()
+        return hmac.compare_digest(stored_hash, legacy_hash)
+    
+    def _verify_secure_password(self, password: str, stored_hash: str) -> bool:
+        """Verifica senhas no formato seguro"""
+        try:
+            parts = stored_hash.split('$')
+            if len(parts) != 4 or parts[0] != 'pbkdf2_sha256':
+                return False
+            
+            iterations = int(parts[1])
+            salt = parts[2]
+            expected_hash = parts[3]
+            
+            password_hash = hashlib.pbkdf2_hmac(
+                'sha256',
+                password.encode('utf-8'),
+                salt.encode('utf-8'),
+                iterations
+            )
+            
+            return hmac.compare_digest(expected_hash, password_hash.hex())
+        except (ValueError, IndexError):
+            return False
+    
+    def _validate_password_strength(self, password: str) -> tuple[bool, str]:
+        """Valida força da senha"""
+        if len(password) < 8:
+            return False, "Senha deve ter pelo menos 8 caracteres"
+        
+        if not re.search(r'[A-Z]', password):
+            return False, "Senha deve conter pelo menos uma letra maiúscula"
+        
+        if not re.search(r'[a-z]', password):
+            return False, "Senha deve conter pelo menos uma letra minúscula"
+        
+        if not re.search(r'\d', password):
+            return False, "Senha deve conter pelo menos um número"
+        
+        # Verifica senhas comuns
+        weak_passwords = [
+            'password', '123456', '12345678', 'admin', 'qwerty',
+            'password123', 'admin123', '123456789', 'senha123'
+        ]
+        if password.lower() in weak_passwords:
+            return False, "Senha muito comum, escolha outra"
+        
+        return True, "Senha válida"
     
     def authenticate(self, username: str, password: str) -> bool:
-        """Autentica usuário"""
-        if username in self.users:
-            return self.users[username]["password_hash"] == self.hash_password(password)
-        return False
+        """Autentica usuário com rate limiting e log seguro"""
+        # Rate limiting simples (em produção, usar Redis/Database)
+        current_time = time.time()
+        rate_limit_key = f"login_attempts_{username}_{int(current_time // 60)}"  # Por minuto
+        
+        if not hasattr(self, '_login_attempts'):
+            self._login_attempts = {}
+        
+        attempts = self._login_attempts.get(rate_limit_key, 0)
+        if attempts >= 5:  # Máximo 5 tentativas por minuto
+            logger.warning(f"[SECURITY] Rate limit excedido para {username[:3]}***")
+            return False
+        
+        if username not in self.users:
+            # Incrementa tentativas mesmo para usuários inexistentes
+            self._login_attempts[rate_limit_key] = attempts + 1
+            logger.warning(f"[SECURITY] Tentativa de login para usuário inexistente: {username[:3]}***")
+            return False
+        
+        stored_hash = self.users[username]["password_hash"]
+        
+        # Verifica formato da senha (legacy vs seguro)
+        if stored_hash.startswith('pbkdf2_sha256$'):
+            is_valid = self._verify_secure_password(password, stored_hash)
+        else:
+            # Formato legacy - migra automaticamente
+            is_valid = self._verify_legacy_password(password, stored_hash)
+            if is_valid:
+                # Migra para formato seguro
+                new_hash = self.hash_password(password)
+                self.users[username]["password_hash"] = new_hash
+                self.save_users()
+                logger.info(f"[SECURITY] Senha migrada para formato seguro: {username[:3]}***")
+        
+        if is_valid:
+            # Login bem-sucedido - limpa tentativas
+            if rate_limit_key in self._login_attempts:
+                del self._login_attempts[rate_limit_key]
+            
+            # Atualiza timestamp de login
+            self.users[username]["last_login"] = get_sao_paulo_time().isoformat()
+            self.save_users()
+            
+            logger.info(f"[SECURITY] Login bem-sucedido: {username[:3]}***")
+            return True
+        else:
+            # Login falhado
+            self._login_attempts[rate_limit_key] = attempts + 1
+            logger.warning(f"[SECURITY] Login falhado: {username[:3]}***")
+            return False
     
     def get_user_info(self, username: str) -> Dict:
         """Pega informações do usuário"""
@@ -174,22 +374,64 @@ class ProductionStreamlitRAG:
         
         if st.session_state.rag_instance is None:
             st.error("❌ Sistema RAG não inicializado corretamente")
-            st.stop()
+            st.error("Por favor, verifique as configurações e recarregue a página")
+            return  # Retorna em vez de parar toda a aplicação
+    
+    def _validate_chat_history(self, history_data) -> List[Dict[str, str]]:
+        """Valida e corrige dados do histórico"""
+        if not isinstance(history_data, list):
+            logger.warning(f"[LOAD] Histórico inválido para {self.user_id}, usando vazio")
+            return []
+        
+        validated_history = []
+        for msg in history_data:
+            if isinstance(msg, dict) and "role" in msg and "content" in msg:
+                # Valida roles válidos
+                if msg["role"] in ["user", "assistant"]:
+                    validated_history.append({
+                        "role": msg["role"],
+                        "content": str(msg["content"])[:5000]  # Limita tamanho da mensagem
+                    })
+        
+        return validated_history
     
     def load_user_data(self):
-        """Carrega dados específicos do usuário"""
+        """Carrega dados específicos do usuário com validação robusta"""
         # Carrega histórico
         if self.memory_file.exists():
             try:
                 with open(self.memory_file, 'r', encoding='utf-8') as f:
                     data = json.load(f)
-                    # Define histórico específico do usuário no RAG
-                    chat_history = data.get("chat_history", [])
-                    st.session_state.rag_instance.chat_history = chat_history
-                    logger.info(f"[LOAD] Histórico carregado: {len(chat_history)} mensagens para {self.user_id}")
-            except Exception as e:
-                logger.warning(f"Erro ao carregar histórico do usuário {self.user_id}: {e}")
-                st.session_state.rag_instance.chat_history = []
+                
+                # Validação da estrutura dos dados
+                if not isinstance(data, dict):
+                    raise ValueError("Arquivo de histórico corrompido")
+                
+                # Valida user_id
+                if data.get("user_id") != self.user_id:
+                    logger.warning(f"[LOAD] User ID inconsistente no arquivo: {data.get('user_id')} vs {self.user_id}")
+                
+                # Carrega e valida histórico
+                raw_history = data.get("chat_history", [])
+                chat_history = self._validate_chat_history(raw_history)
+                
+                # Verifica checksum se existir (novo formato)
+                if "checksum" in data:
+                    expected_checksum = hashlib.md5(json.dumps(raw_history, sort_keys=True).encode()).hexdigest()
+                    if data["checksum"] != expected_checksum:
+                        logger.warning(f"[LOAD] Checksum inválido para {self.user_id}, dados podem estar corrompidos")
+                
+                st.session_state.rag_instance.chat_history = chat_history
+                logger.info(f"[LOAD] Histórico carregado e validado: {len(chat_history)} mensagens para {self.user_id}")
+                
+            except (json.JSONDecodeError, ValueError, KeyError) as e:
+                logger.error(f"Erro ao carregar histórico do usuário {self.user_id}: {e}")
+                # Tenta carregar backup
+                if self._try_load_backup():
+                    logger.info(f"[LOAD] Backup carregado com sucesso para {self.user_id}")
+                else:
+                    st.session_state.rag_instance.chat_history = []
+                    logger.warning(f"[LOAD] Iniciando com histórico vazio para {self.user_id}")
         else:
             st.session_state.rag_instance.chat_history = []
             logger.info(f"[LOAD] Novo usuário, histórico vazio para {self.user_id}")
@@ -197,13 +439,45 @@ class ProductionStreamlitRAG:
         # Carrega estatísticas
         self.user_stats = self._load_user_stats()
     
+    def _try_load_backup(self) -> bool:
+        """Tenta carregar um backup válido"""
+        try:
+            # Procura backups ordenados por data (mais recente primeiro)
+            backups = sorted(
+                self.memory_file.parent.glob(f"{self.memory_file.stem}.*.bak"),
+                key=lambda x: x.stat().st_mtime,
+                reverse=True
+            )
+            
+            for backup_file in backups:
+                try:
+                    with open(backup_file, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                    
+                    if isinstance(data, dict) and "chat_history" in data:
+                        chat_history = self._validate_chat_history(data["chat_history"])
+                        st.session_state.rag_instance.chat_history = chat_history
+                        logger.info(f"[BACKUP] Backup {backup_file.name} carregado para {self.user_id}")
+                        return True
+                        
+                except Exception as e:
+                    logger.warning(f"[BACKUP] Erro ao carregar {backup_file.name}: {e}")
+                    continue
+            
+            return False
+            
+        except Exception as e:
+            logger.error(f"[BACKUP] Erro ao procurar backups: {e}")
+            return False
+    
     def _load_user_stats(self) -> Dict:
         """Carrega estatísticas do usuário"""
         if self.stats_file.exists():
             try:
                 with open(self.stats_file, 'r', encoding='utf-8') as f:
                     return json.load(f)
-            except:
+            except (json.JSONDecodeError, FileNotFoundError, PermissionError) as e:
+                logger.warning(f"Erro ao carregar estatísticas: {e}")
                 pass
         
         return {
@@ -214,44 +488,115 @@ class ProductionStreamlitRAG:
         }
     
     def _save_user_stats(self):
-        """Salva estatísticas do usuário"""
+        """Salva estatísticas do usuário com validação"""
         try:
+            # Garante que as estatísticas tenham estrutura válida
+            required_fields = {
+                "total_questions": 0,
+                "successful_answers": 0,
+                "first_login": get_sao_paulo_time().isoformat(),
+                "last_activity": get_sao_paulo_time().isoformat()
+            }
+            
+            # Mescla com os dados existentes
+            for field, default_value in required_fields.items():
+                if field not in self.user_stats:
+                    self.user_stats[field] = default_value
+            
+            # Atualiza timestamp
             self.user_stats["last_activity"] = get_sao_paulo_time().isoformat()
-            with open(self.stats_file, 'w', encoding='utf-8') as f:
+            
+            # Valida valores numéricos
+            for field in ["total_questions", "successful_answers"]:
+                if not isinstance(self.user_stats[field], int) or self.user_stats[field] < 0:
+                    self.user_stats[field] = 0
+            
+            # Salva de forma atômica
+            temp_file = self.stats_file.with_suffix('.tmp')
+            with open(temp_file, 'w', encoding='utf-8') as f:
                 json.dump(self.user_stats, f, indent=2, ensure_ascii=False)
+            
+            temp_file.replace(self.stats_file)
+            
         except Exception as e:
-            logger.error(f"Erro ao salvar estatísticas: {e}")
+            logger.error(f"Erro ao salvar estatísticas para {self.user_id}: {e}")
+            # Remove arquivo temporário se existir
+            temp_file = self.stats_file.with_suffix('.tmp')
+            if temp_file.exists():
+                temp_file.unlink()
+    
+    def _create_backup_if_needed(self, file_path: Path):
+        """Cria backup do arquivo se ele existir e for grande"""
+        try:
+            if file_path.exists():
+                file_size = file_path.stat().st_size
+                # Se arquivo for maior que 1MB, cria backup
+                if file_size > 1024 * 1024:
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    backup_path = file_path.with_suffix(f".{timestamp}.bak")
+                    shutil.copy2(file_path, backup_path)
+                    
+                    # Remove backups antigos (mais de 30 dias)
+                    for backup in file_path.parent.glob(f"{file_path.stem}.*.bak"):
+                        backup_time = datetime.fromtimestamp(backup.stat().st_mtime)
+                        if datetime.now() - backup_time > timedelta(days=30):
+                            backup.unlink()
+        except Exception as e:
+            logger.warning(f"Erro ao criar backup: {e}")
     
     def save_user_history(self):
-        """Salva histórico do usuário de forma sincronizada"""
+        """Salva histórico do usuário de forma sincronizada com backup automático"""
         try:
+            # Cria backup se necessário
+            self._create_backup_if_needed(self.memory_file)
+            
             # Usa o histórico do frontend como fonte da verdade
             current_history = getattr(st.session_state, 'messages', [])
             
             # Se não houver histórico no frontend, usa o do backend
-            if not current_history and hasattr(st.session_state.rag_instance, 'chat_history'):
-                current_history = st.session_state.rag_instance.chat_history
+            if not current_history and self._safe_check_rag_instance():
+                current_history = getattr(st.session_state.rag_instance, 'chat_history', [])
+            
+            # Validação dos dados
+            if not isinstance(current_history, list):
+                logger.error(f"Histórico inválido: tipo {type(current_history)}")
+                current_history = []
+            
+            # Limita o tamanho do histórico (máximo 200 mensagens)
+            if len(current_history) > 200:
+                logger.info(f"[SAVE] Limitando histórico de {len(current_history)} para 200 mensagens")
+                current_history = current_history[-200:]
             
             memory_data = {
                 "user_id": self.user_id,
                 "last_updated": get_sao_paulo_time().isoformat(),
                 "total_messages": len(current_history),
-                "chat_history": current_history
+                "chat_history": current_history,
+                "version": "2.0",  # Versão do formato de dados
+                "checksum": hashlib.md5(json.dumps(current_history, sort_keys=True).encode()).hexdigest()
             }
             
-            with open(self.memory_file, 'w', encoding='utf-8') as f:
+            # Salva de forma atômica (escreve em temporário e move)
+            temp_file = self.memory_file.with_suffix('.tmp')
+            with open(temp_file, 'w', encoding='utf-8') as f:
                 json.dump(memory_data, f, indent=2, ensure_ascii=False)
             
+            # Move arquivo temporário para final
+            temp_file.replace(self.memory_file)
+            
             # Sincroniza o histórico do backend com o frontend
-            if hasattr(st.session_state.rag_instance, 'chat_history'):
+            if self._safe_check_rag_instance():
                 st.session_state.rag_instance.chat_history = current_history.copy()
             
             self._save_user_stats()
-            logger.debug(f"[SAVE] Histórico salvo: {len(current_history)} mensagens")
+            logger.info(f"[SAVE] Histórico salvo: {len(current_history)} mensagens para {self.user_id}")
             
         except Exception as e:
-            logger.error(f"Erro ao salvar histórico: {e}")
-            # Não exibe erro no Streamlit para evitar inundação de mensagens
+            logger.error(f"Erro ao salvar histórico para {self.user_id}: {e}")
+            # Remove arquivo temporário se existir
+            temp_file = self.memory_file.with_suffix('.tmp')
+            if temp_file.exists():
+                temp_file.unlink()
     
     def ask(self, question: str) -> str:
         """Faz pergunta usando RAG e salva automaticamente"""
@@ -297,6 +642,10 @@ class ProductionStreamlitRAG:
             self.user_stats["total_questions"] += 1
             logger.debug(f"[ASK_ONLY] Total de perguntas do usuário: {self.user_stats['total_questions']}")
             
+            # Verifica se instância RAG é válida
+            if not self._safe_check_rag_instance():
+                return "Erro: Sistema RAG não disponível"
+                
             # Cria uma instância temporária do RAG com o contexto atual
             temp_history = st.session_state.rag_instance.chat_history.copy()
             
@@ -309,8 +658,7 @@ class ProductionStreamlitRAG:
             # Define o histórico temporário
             st.session_state.rag_instance.chat_history = temp_history
             
-            # Usa o método search_and_answer diretamente (sem adicionar ao histórico)
-            from buscador_conversacional_producao import ProductionQueryTransformer
+            # Usa o transformer importado no topo
             transformer = ProductionQueryTransformer(st.session_state.rag_instance.openai_client)
             
             # Transforma a query
@@ -322,10 +670,12 @@ class ProductionStreamlitRAG:
                 clean_query = transformer.clean_query(transformed_query)
                 rag_result = st.session_state.rag_instance.search_and_answer(clean_query)
                 
-                if "error" in rag_result:
+                if isinstance(rag_result, dict) and rag_result.get("error"):
                     response = f"Desculpe, não consegui encontrar informações sobre isso. {rag_result['error']}"
-                else:
+                elif isinstance(rag_result, dict) and "answer" in rag_result:
                     response = rag_result["answer"]
+                else:
+                    response = "Erro: Resposta inválida do sistema RAG"
             
             # Restaura o histórico original
             st.session_state.rag_instance.chat_history = original_history
@@ -337,8 +687,11 @@ class ProductionStreamlitRAG:
             if isinstance(response, str):
                 response = self._clean_rag_response(response)
             
-            # Atualiza estatísticas
-            if "erro" not in response.lower() and "desculpe" not in response.lower():
+            # Atualiza estatísticas (detecção melhorada)
+            error_indicators = ["erro", "desculpe", "error:", "não consegui", "falhou"]
+            is_error = any(indicator in response.lower() for indicator in error_indicators)
+            
+            if not is_error:
                 self.user_stats["successful_answers"] += 1
                 logger.debug(f"[ASK_ONLY] Resposta bem-sucedida registrada")
             else:
@@ -410,13 +763,27 @@ class ProductionStreamlitRAG:
 
     def clear_history(self):
         """Limpa histórico do usuário"""
-        if hasattr(st.session_state.rag_instance, 'clear_history'):
+        if self._safe_check_rag_instance() and hasattr(st.session_state.rag_instance, 'clear_history'):
             st.session_state.rag_instance.clear_history()
         self.save_user_history()
         
+    def _safe_check_rag_instance(self) -> bool:
+        """Verifica seguramente se a instância RAG existe e é válida"""
+        return (
+            hasattr(st.session_state, 'rag_instance') and 
+            st.session_state.rag_instance is not None and
+            hasattr(st.session_state.rag_instance, 'chat_history')
+        )
+    
+    def _safe_get_username(self) -> str:
+        """Retorna username de forma segura"""
+        return getattr(st.session_state, 'username', 'unknown_user')
+    
     def get_chat_history(self) -> List[Dict[str, str]]:
         """Retorna o histórico de chat atual"""
-        return st.session_state.rag_instance.chat_history.copy() if hasattr(st.session_state.rag_instance, 'chat_history') else []
+        if self._safe_check_rag_instance():
+            return st.session_state.rag_instance.chat_history.copy()
+        return []
 
     def get_user_stats(self):
         """Retorna estatísticas do usuário, sempre garantindo estrutura válida"""
@@ -445,8 +812,13 @@ class ProductionStreamlitRAG:
             return self.user_stats.copy()
 
 def login_page():
-    """Página de login do sistema"""
+    """Página de login segura do sistema"""
     st.title("🚀 Login - Sistema RAG Conversacional")
+    
+    # Exibe alertas de segurança se houver
+    if 'security_alert' in st.session_state:
+        st.error(st.session_state.security_alert)
+        del st.session_state.security_alert
     
     # Health check do sistema
     with st.spinner("Verificando sistema...", show_time=True):
@@ -464,33 +836,77 @@ def login_page():
     
     st.markdown("### 🔐 Acesso ao Sistema")
     
+    # Gera token CSRF
+    csrf_token = generate_csrf_token()
+    
     with st.form("login_form"):
-        username = st.text_input("👤 Usuário", placeholder="Digite seu usuário")
-        password = st.text_input("🔒 Senha", type="password", placeholder="Digite sua senha")
+        st.markdown("📊 **Políticas de Segurança:**")
+        st.markdown("- Senhas devem ter pelo menos 8 caracteres")
+        st.markdown("- Incluir maiúsculas, minúsculas e números")
+        st.markdown("- Máximo 5 tentativas por minuto")
+        st.markdown("- Sessão expira em 8 horas")
+        st.markdown("---")
+        
+        username = st.text_input(
+            "👤 Usuário", 
+            placeholder="Digite seu usuário",
+            max_chars=50,
+            help="Nome de usuário para acesso ao sistema"
+        )
+        password = st.text_input(
+            "🔒 Senha", 
+            type="password", 
+            placeholder="Digite sua senha",
+            max_chars=128,
+            help="Senha do usuário"
+        )
+        
+        # Token CSRF oculto
+        st.text_input("csrf_token", value=csrf_token, type="password", key="hidden_csrf", label_visibility="hidden")
+        
         login_button = st.form_submit_button("🚀 Entrar", use_container_width=True)
     
     if login_button:
+        # Valida CSRF token
+        submitted_csrf = st.session_state.get('hidden_csrf', '')
+        if not hmac.compare_digest(submitted_csrf, csrf_token):
+            st.error("❌ Token de segurança inválido")
+            logger.warning("[SECURITY] Token CSRF inválido")
+            return
+        
         if username and password:
+            # Sanitiza entrada
+            username = username.strip()[:50]
+            password = password[:128]
+            
+            # Valida caracteres
+            if not re.match(r'^[a-zA-Z0-9_.-]+$', username):
+                st.error("❌ Nome de usuário contém caracteres inválidos")
+                return
+            
             user_manager = StreamlitUserManager()
             
             if user_manager.authenticate(username, password):
                 # Login bem-sucedido
                 user_info = user_manager.get_user_info(username)
                 
-                logger.info(f"[LOGIN] Login bem-sucedido: {username} - {user_info.get('name')} - {user_info.get('role')}")
-                logger.debug(f"[LOGIN] Permissões do usuário: {user_info.get('permissions', [])}")
-                
+                # Cria sessão segura
                 st.session_state.authenticated = True
                 st.session_state.username = username
                 st.session_state.user_info = user_info
                 st.session_state.user_manager = user_manager
+                st.session_state.login_time = get_sao_paulo_time()
+                st.session_state.last_activity = get_sao_paulo_time()
+                
+                # Gera novo token CSRF após login
+                st.session_state.csrf_token = secrets.token_urlsafe(32)
                 
                 st.success(f"✅ Bem-vindo, {user_info.get('name', username)}!")
-                time.sleep(1)
                 st.rerun()
             else:
-                logger.warning(f"[LOGIN] Tentativa de login falhada para usuário: {username}")
                 st.error("❌ Usuário ou senha incorretos!")
+                # Adiciona delay para prevenir ataques
+                time.sleep(1)
         else:
             st.warning("⚠️ Preencha todos os campos!")
 
@@ -524,12 +940,14 @@ def sidebar_user_info():
             if hasattr(st.session_state, 'rag_instance') and st.session_state.rag_instance:
                 st.session_state.rag_instance.chat_history = []
                 
-            logger.info(f"[CHAT] Histórico limpo para {st.session_state.username}")
+            username = getattr(st.session_state, 'username', 'unknown')
+            logger.info(f"[CHAT] Histórico limpo para {username}")
             st.success("✅ Conversa limpa!")
             st.rerun()
 
         user_manager = st.session_state.get('user_manager')
-        is_admin = user_manager and user_manager.is_admin(st.session_state.username)
+        username = getattr(st.session_state, 'username', None)
+        is_admin = user_manager and username and user_manager.is_admin(username)
         if is_admin:
             st.markdown("---")
             st.markdown("### 🛠️ Painel Admin")
@@ -548,17 +966,11 @@ def sidebar_user_info():
             st.markdown('---')
 
         if st.button("🚪 Logout", key="btn_logout", use_container_width=True):
-            logger.info(f"Logout: {st.session_state.get('username', 'unknown')}")
+            username = getattr(st.session_state, 'username', 'unknown')
+            logger.info(f"[SECURITY] Logout: {username[:3] if username != 'unknown' else 'unknown'}***")
             close_all_modals()
-            # Limpa apenas o necessário para logout
-            for key in [
-                'authenticated', 'username', 'user_info', 'user_manager', 'user_rag',
-                'messages', 'show_user_management', 'show_user_stats',
-                'show_document_management', 'show_ia_config', 'edit_user', 'active_user_tab',
-                'form_key', 'user_updated_message', 'user_deleted_message', 'processando_ia'
-            ]:
-                if key in st.session_state:
-                    del st.session_state[key]
+            clear_session()
+            st.success("👋 Logout realizado com sucesso!")
             st.rerun()
 
 def user_management_modal():
@@ -570,7 +982,8 @@ def user_management_modal():
             st.markdown("# 👥 Gerenciamento de Usuários")
         with col2:
             if st.button("❌ Fechar", key="close_users_header", use_container_width=True):
-                logger.info(f"[MODAL] Gerenciamento de usuários fechado por {st.session_state.username}")
+                username = getattr(st.session_state, 'username', 'unknown')
+                logger.info(f"[MODAL] Gerenciamento de usuários fechado por {username}")
                 close_all_modals()
                 st.rerun()
         
@@ -621,14 +1034,14 @@ def user_management_modal():
                                     st.rerun()
                             
                             with col_delete:
-                                if username != st.session_state.username:  # Não pode deletar a si mesmo
+                                current_username = getattr(st.session_state, 'username', None)
+                                if username != current_username:  # Não pode deletar a si mesmo
                                     if st.button(f"🗑️ Excluir", key=f"delete_{username}"):
                                         # Remove usuário
                                         del user_manager.users[username]
                                         user_manager.save_users()
                                         
                                         # Remove dados da pasta production_users
-                                        import shutil
                                         user_dir = Path(f"production_users/{username}")
                                         if user_dir.exists():
                                             try:
@@ -1475,7 +1888,11 @@ def chat_interface():
     if 'user_rag' not in st.session_state:
         with st.spinner("Inicializando sistema RAG...", show_time=True):
             try:
-                st.session_state.user_rag = ProductionStreamlitRAG(st.session_state.username)
+                username = getattr(st.session_state, 'username', None)
+                if not username:
+                    st.error("❌ Usuário não identificado")
+                    return
+                st.session_state.user_rag = ProductionStreamlitRAG(username)
                 st.success("✅ Sistema inicializado com sucesso!")
             except Exception as e:
                 st.error(f"❌ Erro na inicialização: {e}")
@@ -1513,7 +1930,8 @@ def chat_interface():
     
     # Input para nova mensagem
     if prompt := st.chat_input("Digite sua pergunta..."):
-        logger.info(f"[CHAT] Nova mensagem do usuário {st.session_state.username}: {prompt[:100]}...")
+        username = getattr(st.session_state, 'username', 'unknown')
+        logger.info(f"[CHAT] Nova mensagem do usuário {username}: {prompt[:100]}...")
         
         # PASSO 1: Adiciona pergunta do usuário
         user_message = {"role": "user", "content": prompt}
@@ -1601,6 +2019,10 @@ def main():
     if not st.session_state.authenticated:
         login_page()
     else:
+        # Verifica timeout de sessão
+        if not check_session_timeout():
+            return
+        
         sidebar_user_info()
         # Exibe o modal/tela correta conforme o estado
         if st.session_state.get('show_user_management', False):
