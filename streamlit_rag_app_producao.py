@@ -231,8 +231,19 @@ class StreamlitUserManager:
     def save_users(self):
         """Salva usuários no arquivo"""
         try:
+            # Cria uma cópia limpa dos usuários sem campos desnecessários
+            clean_users = {}
+            fields_to_remove = ['total_conversations', 'successful_queries', 'failed_queries']
+            
+            for username, user_data in self.users.items():
+                clean_user = user_data.copy()
+                for field in fields_to_remove:
+                    if field in clean_user:
+                        del clean_user[field]
+                clean_users[username] = clean_user
+            
             with open(self.users_file, 'w', encoding='utf-8') as f:
-                json.dump(self.users, f, indent=2, ensure_ascii=False)
+                json.dump(clean_users, f, indent=2, ensure_ascii=False)
             return True
         except Exception as e:
             logger.error(f"Erro ao salvar usuários: {e}")
