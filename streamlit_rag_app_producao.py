@@ -205,7 +205,7 @@ def close_all_modals():
         del st.session_state.edit_user
 
 class StreamlitUserManager:
-    """Gerenciador de usuários para Streamlit"""
+    """Gerenciador de usuários para Streamlit - v2.1"""
     
     def __init__(self, users_file="production_users.json"):
         self.users_file = Path(users_file)
@@ -233,8 +233,10 @@ class StreamlitUserManager:
         try:
             with open(self.users_file, 'w', encoding='utf-8') as f:
                 json.dump(self.users, f, indent=2, ensure_ascii=False)
+            return True
         except Exception as e:
             logger.error(f"Erro ao salvar usuários: {e}")
+            return False
     
     def _generate_salt(self) -> str:
         """Gera salt aleatório seguro"""
@@ -591,6 +593,7 @@ class ProductionStreamlitRAG:
         except Exception as e:
             logger.warning(f"Erro ao criar backup: {e}")
     
+    
     def save_user_history(self):
         """Salva histórico do usuário de forma sincronizada com backup automático"""
         try:
@@ -609,10 +612,18 @@ class ProductionStreamlitRAG:
                 logger.error(f"Histórico inválido: tipo {type(current_history)}")
                 current_history = []
             
-            # Limita o tamanho do histórico (máximo 200 mensagens)
-            if len(current_history) > 200:
-                logger.info(f"[SAVE] Limitando histórico de {len(current_history)} para 200 mensagens")
-                current_history = current_history[-200:]
+            # Limita o tamanho do histórico (máximo 8 mensagens para manter contexto gerenciável)
+            MAX_HISTORY_MESSAGES = 8
+            if len(current_history) > MAX_HISTORY_MESSAGES:
+                logger.info(f"[SAVE] Limitando histórico de {len(current_history)} para {MAX_HISTORY_MESSAGES} mensagens")
+                current_history = current_history[-MAX_HISTORY_MESSAGES:]
+                
+                # Atualiza também o session_state com o histórico limitado
+                st.session_state.messages = current_history
+                
+                # Atualiza também o backend se existir
+                if self._safe_check_rag_instance():
+                    st.session_state.rag_instance.chat_history = current_history.copy()
             
             memory_data = {
                 "user_id": self.user_id,
@@ -636,6 +647,7 @@ class ProductionStreamlitRAG:
                 st.session_state.rag_instance.chat_history = current_history.copy()
             
             self._save_user_stats()
+            
             logger.info(f"[SAVE] Histórico salvo: {len(current_history)} mensagens para {self.user_id}")
             
         except Exception as e:
@@ -662,11 +674,21 @@ class ProductionStreamlitRAG:
             processing_time = time.time() - start_time
             logger.info(f"[ASK] Resposta gerada em {processing_time:.2f}s")
             
-            if "erro" not in response.lower() and "desculpe" not in response.lower():
+            # Melhor detecção de respostas bem-sucedidas
+            error_indicators = [
+                "erro", "desculpe", "não consegui", "não encontrei", 
+                "não foi encontrada", "informação não está disponível",
+                "não posso", "não tenho", "não há", "falha"
+            ]
+            
+            response_lower = response.lower()
+            is_error = any(indicator in response_lower for indicator in error_indicators)
+            
+            if not is_error and len(response.strip()) > 20:  # Resposta substancial
                 self.user_stats["successful_answers"] += 1
                 logger.debug(f"[ASK] Resposta bem-sucedida registrada")
             else:
-                logger.warning(f"[ASK] Resposta com possível erro detectado")
+                logger.warning(f"[ASK] Resposta com possível erro ou muito curta detectada")
             
             logger.debug(f"[ASK] Salvando histórico do usuário...")
             self.save_user_history()
@@ -1025,6 +1047,11 @@ def user_management_modal():
             if st.button("❌ Fechar", key="close_users_header", use_container_width=True):
                 username = getattr(st.session_state, 'username', 'unknown')
                 logger.info(f"[MODAL] Gerenciamento de usuários fechado por {username}")
+                # Limpa todos os estados de edição ao fechar
+                if 'edit_user_inline' in st.session_state:
+                    del st.session_state.edit_user_inline
+                if 'editing_in_progress' in st.session_state:
+                    del st.session_state.editing_in_progress
                 close_all_modals()
                 st.rerun()
         
@@ -1036,9 +1063,18 @@ def user_management_modal():
             return
         
         # Tabs para diferentes funcionalidades
-        tab_names = ["📋 Lista de Usuários", "➕ Criar Usuário", "✏️ Editar Usuário", "📊 Estatísticas"]
+        tab_names = ["📋 Lista de Usuários", "➕ Criar Usuário", "📊 Estatísticas"]
         
-        # Cria as tabs
+        # Sempre limpa estado de edição ao renderizar o modal pela primeira vez
+        if 'edit_user_inline' in st.session_state and not st.session_state.get('editing_in_progress', False):
+            del st.session_state.edit_user_inline
+        
+        # Gerencia qual aba está ativa
+        if 'active_user_tab' not in st.session_state:
+            st.session_state.active_user_tab = 0
+        
+        # Cria as tabs com índice dinâmico
+        selected_tab = st.session_state.active_user_tab
         tabs = st.tabs(tab_names)
         
         with tabs[0]:  # Lista de Usuários
@@ -1066,36 +1102,94 @@ def user_management_modal():
                             st.write(f"**Organização:** {user_data.get('organization', 'N/A')}")
                         
                         with col2:
-                            # Botões de ação
-                            col_edit, col_delete = st.columns(2)
-                            with col_edit:
-                                if st.button(f"✏️ Editar", key=f"edit_{username}"):
-                                    st.session_state.edit_user = username
-                                    st.session_state.active_user_tab = 2  # Vai para aba de edição
-                                    st.rerun()
+                            # Botões de ação em layout vertical melhorado
+                            if st.button(f"✏️ Editar {username}", key=f"edit_{username}", use_container_width=True):
+                                st.session_state.edit_user_inline = username
+                                st.session_state.editing_in_progress = True
+                                st.rerun()
                             
-                            with col_delete:
-                                current_username = getattr(st.session_state, 'username', None)
-                                if username != current_username:  # Não pode deletar a si mesmo
-                                    if st.button(f"🗑️ Excluir", key=f"delete_{username}"):
-                                        # Remove usuário
-                                        del user_manager.users[username]
-                                        user_manager.save_users()
-                                        
-                                        # Remove dados da pasta production_users
-                                        user_dir = Path(f"production_users/{username}")
-                                        if user_dir.exists():
-                                            try:
-                                                shutil.rmtree(user_dir)
-                                                logger.info(f"[ADMIN] Dados da pasta removidos para {username}")
-                                            except Exception as e:
-                                                logger.error(f"[ADMIN] Erro ao remover pasta {user_dir}: {e}")
-                                        
-                                        logger.info(f"[ADMIN] Usuário {username} excluído por {st.session_state.username}")
-                                        st.session_state.user_deleted_message = f"✅ Usuário '{username}' excluído com sucesso!"
-                                        st.rerun()
+                            # Botão de excluir
+                            current_username = getattr(st.session_state, 'username', None)
+                            if username != current_username:  # Não pode deletar a si mesmo
+                                if st.button(f"🗑️ Excluir {username}", key=f"delete_{username}", use_container_width=True, type="secondary"):
+                                    # Remove usuário
+                                    del user_manager.users[username]
+                                    user_manager.save_users()
+                                    
+                                    # Remove dados da pasta production_users
+                                    user_dir = Path(f"production_users/{username}")
+                                    if user_dir.exists():
+                                        try:
+                                            shutil.rmtree(user_dir)
+                                            logger.info(f"[ADMIN] Dados da pasta removidos para {username}")
+                                        except Exception as e:
+                                            logger.error(f"[ADMIN] Erro ao remover pasta {user_dir}: {e}")
+                                    
+                                    logger.info(f"[ADMIN] Usuário {username} excluído por {st.session_state.username}")
+                                    st.session_state.user_deleted_message = f"✅ Usuário '{username}' excluído com sucesso!"
+                                    st.rerun()
             else:
                 st.info("Nenhum usuário cadastrado.")
+        
+        # Formulário de edição inline (mostra se um usuário foi selecionado para edição)
+        if st.session_state.get('edit_user_inline'):
+            edit_username = st.session_state.edit_user_inline
+            edit_user_data = user_manager.users.get(edit_username, {})
+            
+            st.markdown("---")
+            st.markdown(f"### ✏️ Editando Usuário: **{edit_username}**")
+            
+            with st.form(f"edit_user_inline_{edit_username}"):
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    new_name = st.text_input("Nome Completo", value=edit_user_data.get('name', ''), max_chars=100)
+                    new_role = st.selectbox("Tipo de Usuário", ["Admin", "Usuário"], 
+                                          index=0 if edit_user_data.get('role') == 'Admin' else 1)
+                
+                with col2:
+                    new_organization = st.text_input("Organização", value=edit_user_data.get('organization', ''), max_chars=100)
+                    new_password = st.text_input("Nova Senha (deixe vazio para manter)", type="password", max_chars=128)
+                
+                new_notes = st.text_area("Observações", value=edit_user_data.get('notes', ''), max_chars=500)
+                
+                col_save, col_cancel = st.columns(2)
+                
+                with col_save:
+                    if st.form_submit_button("💾 Salvar Alterações", use_container_width=True):
+                        # Log dos dados antes da alteração
+                        logger.info(f"[ADMIN] Editando {edit_username}: name={new_name}, role={new_role}, org={new_organization}, notes={new_notes}")
+                        
+                        # Atualiza dados do usuário
+                        user_manager.users[edit_username]['name'] = new_name
+                        user_manager.users[edit_username]['role'] = new_role
+                        user_manager.users[edit_username]['organization'] = new_organization
+                        user_manager.users[edit_username]['notes'] = new_notes
+                        
+                        # Atualiza senha se fornecida
+                        if new_password:
+                            logger.info(f"[ADMIN] Atualizando senha para {edit_username}")
+                            user_manager.users[edit_username]['password_hash'] = user_manager.hash_password(new_password)
+                        
+                        # Salva alterações
+                        if user_manager.save_users():
+                            st.success(f"✅ Usuário '{edit_username}' atualizado com sucesso!")
+                            # Limpa estados de edição
+                            if 'edit_user_inline' in st.session_state:
+                                del st.session_state.edit_user_inline
+                            if 'editing_in_progress' in st.session_state:
+                                del st.session_state.editing_in_progress
+                            st.rerun()
+                        else:
+                            st.error("❌ Erro ao salvar alterações")
+                
+                with col_cancel:
+                    if st.form_submit_button("❌ Cancelar", use_container_width=True):
+                        if 'edit_user_inline' in st.session_state:
+                            del st.session_state.edit_user_inline
+                        if 'editing_in_progress' in st.session_state:
+                            del st.session_state.editing_in_progress
+                        st.rerun()
         
         with tabs[1]:  # Criar Usuário
             st.markdown("#### ➕ Criar Novo Usuário")
@@ -1126,9 +1220,6 @@ def user_management_modal():
                                 "organization": new_organization,
                                 "created_at": get_sao_paulo_time().isoformat(),
                                 "last_login": "",
-                                "total_conversations": 0,
-                                "successful_queries": 0,
-                                "failed_queries": 0,
                                 "active": True,
                                 "notes": ""
                             }
@@ -1154,64 +1245,7 @@ def user_management_modal():
                     else:
                         st.error("❌ Preencha todos os campos obrigatórios!")
         
-        with tabs[2]:  # Editar Usuário
-            st.markdown("#### ✏️ Editar Usuário")
-            
-            if st.session_state.get('edit_user'):
-                edit_username = st.session_state.edit_user
-                edit_user_data = user_manager.users.get(edit_username, {})
-                
-                st.info(f"Editando usuário: **{edit_username}**")
-                
-                with st.form("edit_user_form"):
-                    col1, col2 = st.columns(2)
-                    
-                    with col1:
-                        edit_name = st.text_input("📛 Nome completo", value=edit_user_data.get('name', ''))
-                        edit_new_password = st.text_input("🔒 Nova senha (deixe vazio para manter atual)", type="password")
-                    
-                    with col2:
-                        edit_role = st.selectbox("🎭 Tipo", ["Admin", "Usuário"], 
-                                                index=["Admin", "Usuário"].index(edit_user_data.get('role', 'Usuário')))
-                        edit_organization = st.text_input("🏢 Organização", value=edit_user_data.get('organization', ''))
-                    
-                    col_save, col_cancel = st.columns(2)
-                    
-                    with col_save:
-                        if st.form_submit_button("💾 Salvar Alterações", use_container_width=True):
-                            # Atualiza dados
-                            user_manager.users[edit_username]['name'] = edit_name
-                            user_manager.users[edit_username]['role'] = edit_role
-                            user_manager.users[edit_username]['organization'] = edit_organization
-                            
-                            # Atualiza senha se fornecida
-                            if edit_new_password:
-                                user_manager.users[edit_username]['password_hash'] = user_manager.hash_password(edit_new_password)
-                            
-                            # Salva
-                            user_manager.save_users()
-                            logger.info(f"[ADMIN] Usuário {edit_username} editado por {st.session_state.username}")
-                            
-                            # Mostra sucesso imediatamente na aba atual
-                            st.success(f"✅ Usuário '{edit_username}' atualizado com sucesso!")
-                            
-                            # Define mensagem para mostrar na listagem também
-                            st.session_state.user_updated_message = f"✅ Usuário '{edit_username}' atualizado com sucesso!"
-                            st.session_state.active_user_tab = 0  # Volta para aba de listagem
-                            del st.session_state.edit_user
-                            
-                            # Pequeno delay para usuário ver a mensagem
-                            time.sleep(1)
-                            st.rerun()
-                    
-                    with col_cancel:
-                        if st.form_submit_button("❌ Cancelar", use_container_width=True):
-                            del st.session_state.edit_user
-                            st.rerun()
-            else:
-                st.info("Selecione um usuário na aba 'Lista de Usuários' para editar.")
-        
-        with tabs[3]:  # Estatísticas
+        with tabs[2]:  # Estatísticas
             st.markdown("#### 📊 Estatísticas de Uso")
             
             # Estatísticas gerais
@@ -1980,45 +2014,74 @@ def chat_interface():
         if hasattr(st.session_state.rag_instance, 'chat_history'):
             st.session_state.rag_instance.chat_history.append(user_message)
         
-        # PASSO 2: Processa resposta
-        start_time = time.time()
-        try:
-            # Usa o método que não duplica histórico
-            resposta = st.session_state.user_rag.ask_question_only(prompt)
+        # Marca que estamos processando uma resposta
+        st.session_state.processing_response = True
+        
+        # Recarrega para mostrar a mensagem do usuário imediatamente
+        st.rerun()
+    
+    # Se estamos processando uma resposta, processa agora
+    if getattr(st.session_state, 'processing_response', False):
+        # Verifica se a última mensagem é do usuário (sem resposta ainda)
+        if (st.session_state.messages and 
+            st.session_state.messages[-1]["role"] == "user" and
+            (len(st.session_state.messages) == 1 or 
+             st.session_state.messages[-2]["role"] == "assistant")):
+            prompt = st.session_state.messages[-1]["content"]
             
-            processing_time = time.time() - start_time
-            logger.info(f"[CHAT] Resposta processada em {processing_time:.2f}s para {st.session_state.username}")
-            logger.debug(f"[CHAT] Resposta: {resposta[:200]}...")
-            
-            # PASSO 3: Adiciona resposta ao histórico
-            assistant_message = {"role": "assistant", "content": resposta}
-            st.session_state.messages.append(assistant_message)
-            
-            # Adiciona ao backend
-            if hasattr(st.session_state.rag_instance, 'chat_history'):
-                st.session_state.rag_instance.chat_history.append(assistant_message)
-                
-                # PASSO 4: Salva histórico (apenas uma vez)
-                try:
-                    st.session_state.user_rag.save_user_history()
-                    logger.debug(f"[CHAT] Histórico salvo com {len(st.session_state.messages)} mensagens")
-                except Exception as save_error:
-                    logger.error(f"[CHAT] Erro ao salvar histórico: {save_error}")
-                
-                # Recarrega a página para mostrar as mensagens sem duplicação
-                st.rerun()
-                    
-        except Exception as e:
-            error_time = time.time() - start_time
-            error_msg = f"❌ Erro ao processar pergunta: {e}"
-            logger.error(f"[CHAT] Erro no chat para {st.session_state.username} após {error_time:.2f}s: {e}", exc_info=True)
-            
-            # Adiciona mensagem de erro ao histórico
-            error_message = {"role": "assistant", "content": error_msg}
-            st.session_state.messages.append(error_message)
-            
-            # Recarrega a página
-            st.rerun()
+            # Mostra indicador de processamento
+            with st.chat_message("assistant"):
+                with st.spinner("🧠 Processando com IA..."):
+                    start_time = time.time()
+                    try:
+                        # Usa o método que não duplica histórico
+                        resposta = st.session_state.user_rag.ask_question_only(prompt)
+                        
+                        processing_time = time.time() - start_time
+                        logger.info(f"[CHAT] Resposta processada em {processing_time:.2f}s para {st.session_state.username}")
+                        logger.debug(f"[CHAT] Resposta: {resposta[:200]}...")
+                        
+                        # Exibe a resposta
+                        st.markdown(resposta)
+                        
+                        # PASSO 3: Adiciona resposta ao histórico
+                        assistant_message = {"role": "assistant", "content": resposta}
+                        st.session_state.messages.append(assistant_message)
+                        
+                        # Adiciona ao backend
+                        if hasattr(st.session_state.rag_instance, 'chat_history'):
+                            st.session_state.rag_instance.chat_history.append(assistant_message)
+                            
+                            # PASSO 4: Salva histórico (apenas uma vez)
+                            try:
+                                st.session_state.user_rag.save_user_history()
+                                logger.debug(f"[CHAT] Histórico salvo com {len(st.session_state.messages)} mensagens")
+                            except Exception as save_error:
+                                logger.error(f"[CHAT] Erro ao salvar histórico: {save_error}")
+                        
+                        # Marca processamento como concluído
+                        st.session_state.processing_response = False
+                        
+                        # Recarrega uma última vez para mostrar tudo limpo
+                        st.rerun()
+                            
+                    except Exception as e:
+                        error_time = time.time() - start_time
+                        error_msg = f"❌ Erro ao processar pergunta: {e}"
+                        logger.error(f"[CHAT] Erro no chat para {st.session_state.username} após {error_time:.2f}s: {e}", exc_info=True)
+                        
+                        # Exibe erro
+                        st.markdown(error_msg)
+                        
+                        # Adiciona mensagem de erro ao histórico
+                        error_message = {"role": "assistant", "content": error_msg}
+                        st.session_state.messages.append(error_message)
+                        
+                        # Marca processamento como concluído
+                        st.session_state.processing_response = False
+                        
+                        # Recarrega a página
+                        st.rerun()
 
 def main():
     """Função principal da aplicação"""

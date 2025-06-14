@@ -114,9 +114,6 @@ class ProductionUserManager:
             "organization": organization,
             "created_at": get_sao_paulo_time().isoformat(),
             "last_login": "",
-            "total_conversations": 0,
-            "successful_queries": 0,
-            "failed_queries": 0,
             "active": True,
             "notes": ""
         }
