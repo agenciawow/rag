@@ -10,9 +10,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, Optional
 from zoneinfo import ZoneInfo
+import re
+import tempfile
+from dotenv import load_dotenv
 
 # Importa a versão do sistema
-from buscador_conversacional_producao import ProductionConversationalRAG, health_check
+from buscador_conversacional_producao import ProductionConversationalRAG, health_check, test_apis
 
 # Configuração da página
 st.set_page_config(
@@ -65,22 +68,10 @@ def get_sao_paulo_time():
 
 def close_all_modals():
     """Fecha todos os modals abertos"""
-    # Log quais modals estavam abertos
-    open_modals = []
-    if st.session_state.get('show_user_management', False):
-        open_modals.append('Gerenciamento de Usuários')
-    if st.session_state.get('show_user_stats', False):
-        open_modals.append('Estatísticas Pessoais')
-    if st.session_state.get('show_document_management', False):
-        open_modals.append('Gerenciamento de Documentos')
-    
-    if open_modals:
-        logger.debug(f"[MODAL] Fechando modals: {', '.join(open_modals)}")
-    
     st.session_state.show_user_management = False
     st.session_state.show_user_stats = False
     st.session_state.show_document_management = False
-    # Limpa estado de edição se existir
+    st.session_state.show_ia_config = False
     if 'edit_user' in st.session_state:
         del st.session_state.edit_user
 
@@ -280,28 +271,128 @@ class ProductionStreamlitRAG:
             logger.error(f"[ASK] Erro na pergunta do usuário {self.user_id} após {error_time:.2f}s: {e}", exc_info=True)
             return f"❌ Erro ao processar pergunta: {e}"
     
+    def _ask_without_history_update(self, question: str) -> str:
+        """Faz pergunta usando RAG SEM atualizar o histórico automaticamente"""
+        start_time = time.time()
+        
+        logger.info(f"[ASK_NO_HISTORY] Usuário {self.user_id} perguntou: {question[:100]}...")
+        
+        try:
+            self.user_stats["total_questions"] += 1
+            logger.debug(f"[ASK_NO_HISTORY] Total de perguntas do usuário: {self.user_stats['total_questions']}")
+            
+            # Salva histórico atual antes da pergunta
+            current_history = st.session_state.rag_instance.chat_history.copy()
+            
+            # Usa o método ask do sistema (que vai adicionar pergunta e resposta)
+            logger.debug(f"[ASK_NO_HISTORY] Chamando RAG...")
+            response = st.session_state.rag_instance.ask(question)
+            
+            # Restaura histórico original (remove pergunta e resposta que foram adicionadas automaticamente)
+            st.session_state.rag_instance.chat_history = current_history
+            
+            processing_time = time.time() - start_time
+            logger.info(f"[ASK_NO_HISTORY] Resposta gerada em {processing_time:.2f}s")
+            
+            # Limpa a resposta removendo qualquer mensagem de "Resposta gerada" ou similar
+            if isinstance(response, str):
+                # Remove linhas que contenham indicadores de tempo ou status
+                cleaned_response = self._clean_rag_response(response)
+                response = cleaned_response
+            
+            if "erro" not in response.lower() and "desculpe" not in response.lower():
+                self.user_stats["successful_answers"] += 1
+                logger.debug(f"[ASK_NO_HISTORY] Resposta bem-sucedida registrada")
+            else:
+                logger.warning(f"[ASK_NO_HISTORY] Resposta com possível erro detectado")
+            
+            logger.info(f"[ASK_NO_HISTORY] Processo completo em {time.time() - start_time:.2f}s")
+            return response
+            
+        except Exception as e:
+            error_time = time.time() - start_time
+            logger.error(f"[ASK_NO_HISTORY] Erro na pergunta do usuário {self.user_id} após {error_time:.2f}s: {e}", exc_info=True)
+            return f"❌ Erro ao processar pergunta: {e}"
+    
+    def _clean_rag_response(self, response: str) -> str:
+        """Remove mensagens de status e indicadores de tempo da resposta"""
+        if not response:
+            return response
+        
+        # Lista de padrões a serem removidos
+        patterns_to_remove = [
+            r'⏱️.*?gerada.*?',  # Remove "⏱️ Resposta gerada" e variações
+            r'⏰.*?tempo.*?',   # Remove indicadores de tempo
+            r'🕐.*?atividade.*?', # Remove última atividade
+            r'Tempo de.*?:.*?\n',  # Remove "Tempo de processamento: X.Xs"
+            r'Response time:.*?\n', # Remove "Response time: X.Xs"
+            r'Processado em.*?\n',  # Remove "Processado em X.Xs"
+            r'Generated in.*?\n',   # Remove "Generated in X.Xs"
+        ]
+        
+        cleaned = response
+        for pattern in patterns_to_remove:
+            cleaned = re.sub(pattern, '', cleaned, flags=re.IGNORECASE | re.MULTILINE)
+        
+        # Remove linhas em branco extras
+        lines = cleaned.split('\n')
+        cleaned_lines = []
+        for line in lines:
+            stripped = line.strip()
+            # Remove linhas que são só indicadores de tempo/status
+            if not any(indicator in stripped.lower() for indicator in [
+                '⏱️', '⏰', '🕐', 'resposta gerada', 'tempo de', 'processado em', 
+                'generated in', 'response time', 'processing time'
+            ]):
+                cleaned_lines.append(line)
+        
+        # Reconstrói o texto e remove espaços extras
+        result = '\n'.join(cleaned_lines).strip()
+        
+        # Remove múltiplas linhas em branco consecutivas
+        result = re.sub(r'\n\s*\n\s*\n', '\n\n', result)
+        
+        return result
+
     def clear_history(self):
         """Limpa histórico do usuário"""
-        st.session_state.rag_instance.clear_history()
-        self.save_user_history()
-        logger.info(f"Histórico limpo para usuário {self.user_id}")
-    
-    def get_history(self):
-        """Retorna histórico atual"""
-        return st.session_state.rag_instance.chat_history
-    
-    
-    
+        if hasattr(st.session_state.rag_instance, 'clear_history'):
+            st.session_state.rag_instance.clear_history()
+        if hasattr(self, 'save_user_history'):
+            self.save_user_history()
+
     def get_user_stats(self):
-        """Retorna estatísticas do usuário"""
-        return self.user_stats.copy()
+        """Retorna estatísticas do usuário, sempre garantindo estrutura válida"""
+        padrao = {
+            "total_questions": 0,
+            "successful_answers": 0,
+            "first_login": get_sao_paulo_time().isoformat(),
+            "last_activity": get_sao_paulo_time().isoformat()
+        }
+        try:
+            # Tenta carregar do atributo
+            stats = getattr(self, 'user_stats', None)
+            if not stats or not isinstance(stats, dict):
+                stats = self._load_user_stats()
+            # Garante todos os campos
+            for k, v in padrao.items():
+                if k not in stats:
+                    stats[k] = v
+            self.user_stats = stats
+            return stats.copy()
+        except Exception as e:
+            logger.error(f"Erro ao acessar estatísticas do usuário: {e}")
+            # Força regravação do arquivo com valores padrão
+            self.user_stats = padrao
+            self._save_user_stats()
+            return self.user_stats.copy()
 
 def login_page():
     """Página de login do sistema"""
     st.title("🚀 Login - Sistema RAG Conversacional")
     
     # Health check do sistema
-    with st.spinner("Verificando sistema..."):
+    with st.spinner("Verificando sistema...", show_time=True):
         try:
             health_status = health_check()
             if health_status["status"] == "healthy":
@@ -314,92 +405,96 @@ def login_page():
         except Exception as e:
             st.error(f"❌ Erro no health check: {str(e)}")
     
-        st.markdown("### 🔐 Acesso ao Sistema")
-        
-        
-        with st.form("login_form"):
-            username = st.text_input("👤 Usuário", placeholder="Digite seu usuário")
-            password = st.text_input("🔒 Senha", type="password", placeholder="Digite sua senha")
-            login_button = st.form_submit_button("🚀 Entrar", use_container_width=True)
-        
-        if login_button:
-            if username and password:
-                user_manager = StreamlitUserManager()
+    st.markdown("### 🔐 Acesso ao Sistema")
+    
+    with st.form("login_form"):
+        username = st.text_input("👤 Usuário", placeholder="Digite seu usuário")
+        password = st.text_input("🔒 Senha", type="password", placeholder="Digite sua senha")
+        login_button = st.form_submit_button("🚀 Entrar", use_container_width=True)
+    
+    if login_button:
+        if username and password:
+            user_manager = StreamlitUserManager()
+            
+            if user_manager.authenticate(username, password):
+                # Login bem-sucedido
+                user_info = user_manager.get_user_info(username)
                 
-                if user_manager.authenticate(username, password):
-                    # Login bem-sucedido
-                    user_info = user_manager.get_user_info(username)
-                    
-                    logger.info(f"[LOGIN] Login bem-sucedido: {username} - {user_info.get('name')} - {user_info.get('role')}")
-                    logger.debug(f"[LOGIN] Permissões do usuário: {user_info.get('permissions', [])}")
-                    
-                    st.session_state.authenticated = True
-                    st.session_state.username = username
-                    st.session_state.user_info = user_info
-                    st.session_state.user_manager = user_manager
-                    
-                    st.success(f"✅ Bem-vindo, {user_info.get('name', username)}!")
-                    time.sleep(1)
-                    st.rerun()
-                else:
-                    logger.warning(f"[LOGIN] Tentativa de login falhada para usuário: {username}")
-                    st.error("❌ Usuário ou senha incorretos!")
+                logger.info(f"[LOGIN] Login bem-sucedido: {username} - {user_info.get('name')} - {user_info.get('role')}")
+                logger.debug(f"[LOGIN] Permissões do usuário: {user_info.get('permissions', [])}")
+                
+                st.session_state.authenticated = True
+                st.session_state.username = username
+                st.session_state.user_info = user_info
+                st.session_state.user_manager = user_manager
+                
+                st.success(f"✅ Bem-vindo, {user_info.get('name', username)}!")
+                time.sleep(1)
+                st.rerun()
             else:
-                st.warning("⚠️ Preencha todos os campos!")
-        
+                logger.warning(f"[LOGIN] Tentativa de login falhada para usuário: {username}")
+                st.error("❌ Usuário ou senha incorretos!")
+        else:
+            st.warning("⚠️ Preencha todos os campos!")
 
 def sidebar_user_info():
-    """Sidebar otimizada com informações do usuário e sistema"""
     with st.sidebar:
         st.markdown("### 👤 Usuário Logado")
         user_info = st.session_state.get('user_info', {})
-        
         st.markdown(f"**Nome:** {user_info.get('name', 'N/A')}")
         st.markdown(f"**Perfil:** {user_info.get('role', 'N/A')}")
         st.markdown(f"**Organização:** {user_info.get('organization', 'N/A')}")
-        
         st.markdown("---")
-        
-        # Botões de ação com permissões
-        if st.button("📊 Minhas Estatísticas", use_container_width=True):
-            # Fecha todos os modals e abre apenas este
+
+        if st.button("🏠 Home", key="btn_home", use_container_width=True):
+            close_all_modals()
+            st.rerun()
+
+        if st.button("📊 Minhas Estatísticas", key="btn_stats", use_container_width=True):
             close_all_modals()
             st.session_state.show_user_stats = True
-        
-        if st.button("🧹 Limpar Conversa", use_container_width=True):
+            st.rerun()
+
+        if st.button("🧹 Limpar Conversa", key="btn_clear", use_container_width=True):
+            st.session_state.messages = []
             if 'user_rag' in st.session_state:
                 st.session_state.user_rag.clear_history()
-                st.success("✅ Conversa limpa!")
-                st.rerun()
-        
-        # Painel administrativo (apenas para admins)
+                st.session_state.user_rag.save_user_history()
+            st.success("✅ Conversa limpa!")
+            st.rerun()
+
         user_manager = st.session_state.get('user_manager')
-        if user_manager and user_manager.is_admin(st.session_state.username):
+        is_admin = user_manager and user_manager.is_admin(st.session_state.username)
+        if is_admin:
             st.markdown("---")
             st.markdown("### 🛠️ Painel Admin")
-            if st.button("👥 Gerenciar Usuários", use_container_width=True):
-                logger.info(f"[ADMIN] Painel de gerenciamento acessado por {st.session_state.username}")
-                # Fecha todos os modals e abre apenas este
+            if st.button("👥 Gerenciar Usuários", key="btn_admin_users", use_container_width=True):
                 close_all_modals()
                 st.session_state.show_user_management = True
-            
-            if st.button("📄 Gerenciar Documentos", use_container_width=True):
-                logger.info(f"[ADMIN] Painel de documentos acessado por {st.session_state.username}")
-                # Fecha todos os modals e abre apenas este
+                st.rerun()
+            if st.button("📄 Gerenciar Documentos", key="btn_admin_docs", use_container_width=True):
                 close_all_modals()
                 st.session_state.show_document_management = True
-        
-        if st.button("🚪 Logout", use_container_width=True):
-            # Log da saída
-            logger.info(f"Logout: {st.session_state.get('username', 'unknown')}")
-            
-            # Limpa modals e sessão
-            close_all_modals()
-            for key in list(st.session_state.keys()):
-                del st.session_state[key]
-            st.rerun()
-        
+                st.rerun()
+            if st.button('🤖 Configurações de IA', key="btn_admin_ia", use_container_width=True):
+                close_all_modals()
+                st.session_state.show_ia_config = True
+                st.rerun()
+            st.markdown('---')
 
+        if st.button("🚪 Logout", key="btn_logout", use_container_width=True):
+            logger.info(f"Logout: {st.session_state.get('username', 'unknown')}")
+            close_all_modals()
+            # Limpa apenas o necessário para logout
+            for key in [
+                'authenticated', 'username', 'user_info', 'user_manager', 'user_rag',
+                'messages', 'show_user_management', 'show_user_stats',
+                'show_document_management', 'show_ia_config', 'edit_user', 'active_user_tab',
+                'form_key', 'user_updated_message', 'user_deleted_message', 'processando_ia'
+            ]:
+                if key in st.session_state:
+                    del st.session_state[key]
+            st.rerun()
 
 def user_management_modal():
     """Modal para gerenciamento de usuários (apenas admins)"""
@@ -452,7 +547,6 @@ def user_management_modal():
                             st.write(f"**Organização:** {user_data.get('organization', 'N/A')}")
                         
                         with col2:
-                            
                             # Botões de ação
                             col_edit, col_delete = st.columns(2)
                             with col_edit:
@@ -651,7 +745,6 @@ def user_management_modal():
                         with col2:
                             st.metric("✅ Sucessos", stats.get('successful_answers', 0))
                         
-                        
                         with col4:
                             success_rate = 0
                             if stats.get('total_questions', 0) > 0:
@@ -680,13 +773,10 @@ def document_management_modal():
                 logger.info(f"[MODAL] Gerenciamento de documentos fechado por {st.session_state.username}")
                 close_all_modals()
                 st.rerun()
-        
         st.markdown("---")
-        
-        # Tabs para diferentes funcionalidades
+        # Tabs para funcionalidades (incluindo configurações do banco)
         tab_names = ["📤 Upload/Indexar", "📋 Documentos Indexados", "⚙️ Configurações"]
         tabs = st.tabs(tab_names)
-        
         with tabs[0]:  # Upload/Indexar
             st.markdown("#### 📤 Adicionar Novo Documento")
             
@@ -703,19 +793,28 @@ def document_management_modal():
                     st.session_state.clear_url_field = False
                     st.session_state.pdf_url_input = ""
 
+                def validate_url(url):
+                    if not url:
+                        return None
+                    if url.lower().endswith('.pdf') or 'arxiv.org/pdf/' in url:
+                        st.success("✅ URL válida detectada!")
+                        return True
+                    else:
+                        st.warning("⚠️ A URL pode não ser um PDF válido. Prossiga com cuidado.")
+                        return False
+
                 pdf_url = st.text_input(
                     "URL do documento PDF:",
                     key="pdf_url_input",
                     placeholder="https://arxiv.org/pdf/2501.13956",
-                    help="Cole aqui o link direto para o arquivo PDF"
+                    help="Cole aqui o link direto para o arquivo PDF",
+                    on_change=validate_url,
+                    args=(st.session_state.get("pdf_url_input", ""),)
                 )
                 
-                if pdf_url and st.button("🔍 Validar URL", use_container_width=True):
-                    # Validação básica da URL
-                    if pdf_url.lower().endswith('.pdf') or 'arxiv.org/pdf/' in pdf_url:
-                        st.success("✅ URL válida detectada!")
-                    else:
-                        st.warning("⚠️ A URL pode não ser um PDF válido. Prossiga com cuidado.")
+                # Validação inicial se já houver URL
+                if pdf_url:
+                    validate_url(pdf_url)
                 
                 source_type = "url"
                 source_value = pdf_url
@@ -769,12 +868,23 @@ def document_management_modal():
                         # Processa o arquivo real
                         if source_type == "upload":
                             # Salva arquivo temporário para upload
-                            import tempfile
                             import subprocess
                             import sys
                             temp_pdf_path = None
+                            result = None  # Inicializa result como None
+                            
                             try:
-                                with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf', prefix='temp_upload_') as tmp_file:
+                                # Obtém o diretório atual do workspace
+                                current_dir = os.path.dirname(os.path.abspath(__file__))
+                                
+                                # Obtém o nome original do arquivo
+                                original_filename = source_value.name
+                                # Remove extensão .pdf se existir
+                                base_filename = os.path.splitext(original_filename)[0]
+                                # Substitui espaços por underscores e remove caracteres especiais
+                                safe_filename = re.sub(r'[^a-zA-Z0-9_-]', '_', base_filename)
+                                
+                                with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf', prefix=f'temp_{safe_filename}_') as tmp_file:
                                     tmp_file.write(source_value.getvalue())
                                     temp_pdf_path = tmp_file.name
                                 
@@ -785,6 +895,8 @@ def document_management_modal():
                                 # Prepara ambiente com todas as variáveis necessárias
                                 env = os.environ.copy()
                                 env['PDF_URL'] = temp_pdf_path
+                                # Adiciona o nome original do arquivo como variável de ambiente
+                                env['ORIGINAL_FILENAME'] = safe_filename
                                 
                                 # Garante que todas as variáveis do Astra DB estão presentes
                                 required_env_vars = [
@@ -802,7 +914,12 @@ def document_management_modal():
                                 
                                 result = subprocess.run([
                                     sys.executable, "-u", "indexador.py"
-                                ], env=env, capture_output=True, text=True, cwd="/workspaces/rag", timeout=300)
+                                ], 
+                                env=env, 
+                                capture_output=True, 
+                                text=True, 
+                                cwd=current_dir,  # Usa o diretório atual do script
+                                timeout=300)
                                 
                                 logger.info(f"[INDEXING] Indexador finalizado com código: {result.returncode}")
                                 if result.stdout:
@@ -826,11 +943,17 @@ def document_management_modal():
                                     if result.stdout:
                                         st.text(f"**Saída do processo:** {result.stdout}")
                                     
-                            except subprocess.TimeoutExpired:
+                            except subprocess.TimeoutExpired as e:
                                 st.error("❌ Timeout na indexação (5 minutos). Documento muito grande ou processamento lento.")
+                                logger.error(f"[INDEXING] Timeout: {str(e)}")
                             except Exception as e:
                                 logger.error(f"[INDEXING] Erro durante indexação: {e}")
                                 st.error(f"❌ Erro durante indexação: {e}")
+                                # Mostra stderr se disponível
+                                if result and hasattr(result, 'stderr') and result.stderr:
+                                    st.error(f"**Erro detalhado:** {result.stderr}")
+                                if result and hasattr(result, 'stdout') and result.stdout:
+                                    st.text(f"**Saída do processo:** {result.stdout}")
                             finally:
                                 # Remove arquivo temporário se ainda existir
                                 if temp_pdf_path and os.path.exists(temp_pdf_path):
@@ -839,7 +962,6 @@ def document_management_modal():
                                         logger.info(f"[INDEXING] Arquivo temporário removido: {temp_pdf_path}")
                                     except Exception as e:
                                         logger.warning(f"[INDEXING] Erro ao remover arquivo temporário: {e}")
-                                    
                         else:
                             # URL processing real
                             import subprocess
@@ -866,10 +988,21 @@ def document_management_modal():
                             
                             logger.info(f"[INDEXING] Executando indexador com URL: {source_value}")
                             
+                            # Inicializa result como None para evitar erro de variável não definida
+                            result = None
+                            
                             try:
+                                # Obtém o diretório atual do workspace
+                                current_dir = os.path.dirname(os.path.abspath(__file__))
+                                
                                 result = subprocess.run([
                                     sys.executable, "-u", "indexador.py"
-                                ], env=env, capture_output=True, text=True, cwd="/workspaces/rag", timeout=600)
+                                ], 
+                                env=env, 
+                                capture_output=True, 
+                                text=True, 
+                                cwd=current_dir,  # Usa o diretório atual do script
+                                timeout=600)
                                 
                                 logger.info(f"[INDEXING] Indexador finalizado com código: {result.returncode}")
                                 if result.stdout:
@@ -893,11 +1026,17 @@ def document_management_modal():
                                     if result.stdout:
                                         st.text(f"**Saída do processo:** {result.stdout}")
                                         
-                            except subprocess.TimeoutExpired:
+                            except subprocess.TimeoutExpired as e:
                                 st.error("❌ Timeout na indexação (10 minutos). URL inacessível ou processamento muito lento.")
+                                logger.error(f"[INDEXING] Timeout: {str(e)}")
                             except Exception as e:
                                 logger.error(f"[INDEXING] Erro durante indexação: {e}")
                                 st.error(f"❌ Erro durante indexação: {e}")
+                                # Mostra stderr se disponível
+                                if result and hasattr(result, 'stderr') and result.stderr:
+                                    st.error(f"**Erro detalhado:** {result.stderr}")
+                                if result and hasattr(result, 'stdout') and result.stdout:
+                                    st.text(f"**Saída do processo:** {result.stdout}")
                         
                         # Log da indexação
                         logger.info(f"[ADMIN] Documento indexado por {st.session_state.username}: {source_type}={str(source_value)[:100]}")
@@ -977,35 +1116,54 @@ def document_management_modal():
                                     st.write(f"📄 **{doc_name}**")
                                 
                                 with col2:
-                                    if st.button("🗑️ Remover", key=f"remove_{hash(doc_source)}", use_container_width=True):
-                                        if st.session_state.get(f'confirm_delete_{hash(doc_source)}', False):
-                                            try:
-                                                # Remove todos os chunks relacionados ao documento
-                                                result = collection.delete_many({"doc_source": doc_source})
-                                                
-                                                # Remove imagens relacionadas
-                                                import glob
-                                                pdf_images_dir = "pdf_images"
-                                                if os.path.exists(pdf_images_dir):
-                                                    doc_base_name = doc_name.replace(".pdf", "").replace(" ", "_")
-                                                    for img_file in glob.glob(f"{pdf_images_dir}/*{doc_base_name}*"):
-                                                        try:
-                                                            os.remove(img_file)
-                                                        except:
-                                                            pass
-                                                
-                                                st.success(f"✅ Documento '{doc_name}' removido! {result.deleted_count} chunks excluídos.")
-                                                st.session_state[f'confirm_delete_{hash(doc_source)}'] = False
-                                                # Aguarda um pouco para que o usuário veja a mensagem
-                                                time.sleep(1)
-                                                st.rerun()
-                                                
-                                            except Exception as e:
-                                                st.error(f"❌ Erro ao remover documento: {str(e)}")
-                                        else:
-                                            st.session_state[f'confirm_delete_{hash(doc_source)}'] = True
-                                            st.warning("⚠️ Clique novamente para confirmar a remoção.")
+                                    # Botão de remover com confirmação
+                                    delete_key = f"remove_{hash(doc_source)}"
+                                    confirm_key = f"confirm_delete_{hash(doc_source)}"
+                                    cancel_key = f"cancel_delete_{hash(doc_source)}"
+                                    
+                                    # Se não estiver em modo de confirmação
+                                    if not st.session_state.get(confirm_key, False):
+                                        if st.button("🗑️ Remover", key=delete_key, use_container_width=True):
+                                            st.session_state[confirm_key] = True
                                             st.rerun()
+                                    else:
+                                        # Modo de confirmação
+                                        st.warning("⚠️ Clique novamente para confirmar a remoção.")
+                                        
+                                        col_confirm, col_cancel = st.columns(2)
+                                        with col_confirm:
+                                            if st.button("✅ Confirmar", key=f"confirm_{delete_key}", use_container_width=True):
+                                                try:
+                                                    # Remove todos os chunks relacionados ao documento
+                                                    result = collection.delete_many({"doc_source": doc_source})
+                                                    
+                                                    # Remove imagens relacionadas
+                                                    import glob
+                                                    pdf_images_dir = "pdf_images"
+                                                    if os.path.exists(pdf_images_dir):
+                                                        doc_base_name = doc_name.replace(".pdf", "").replace(" ", "_")
+                                                        for img_file in glob.glob(f"{pdf_images_dir}/*{doc_base_name}*"):
+                                                            try:
+                                                                os.remove(img_file)
+                                                            except:
+                                                                pass
+                                                    
+                                                    st.success(f"✅ Documento '{doc_name}' removido! {result.deleted_count} chunks excluídos.")
+                                                    # Limpa o estado de confirmação
+                                                    st.session_state[confirm_key] = False
+                                                    # Aguarda um pouco para que o usuário veja a mensagem
+                                                    time.sleep(2)
+                                                    st.rerun()
+                                                    
+                                                except Exception as e:
+                                                    st.error(f"❌ Erro ao remover documento: {str(e)}")
+                                                    st.session_state[confirm_key] = False
+                                        
+                                        with col_cancel:
+                                            if st.button("❌ Cancelar", key=cancel_key, use_container_width=True):
+                                                # Limpa o estado de confirmação
+                                                st.session_state[confirm_key] = False
+                                                st.rerun()
                     else:
                         st.info("📄 Nenhum documento indexado encontrado.")
                 else:
@@ -1013,62 +1171,52 @@ def document_management_modal():
                     
             except Exception as e:
                 st.error(f"❌ Erro ao carregar documentos: {str(e)}")
-        
-        with tabs[2]:  # Configurações
-            st.markdown("#### ⚙️ Configurações do Sistema")
-            
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                st.markdown("##### 🗄️ Configurações do Banco de Dados")
-                
-                # Mostra informações da conexão (sem revelar credenciais)
-                astra_endpoint = os.getenv("ASTRA_DB_API_ENDPOINT", "")
-                if astra_endpoint:
-                    endpoint_display = astra_endpoint[:30] + "..." if len(astra_endpoint) > 30 else astra_endpoint
-                    st.info(f"**Endpoint:** {endpoint_display}")
-                else:
-                    st.warning("⚠️ Endpoint do Astra DB não configurado")
-                
-                collection_name = "pdf_documents"  # Do buscador
-                st.info(f"**Collection:** {collection_name}")
-                
-                # Teste de conectividade
-                if st.button("🔗 Testar Conexão", use_container_width=True):
+
+        with tabs[2]:  # Configurações do Banco
+            st.markdown("#### ⚙️ Configurações de Conexão com o Banco de Dados")
+            with st.form("db_config_form"):
+                current_endpoint = os.getenv("ASTRA_DB_API_ENDPOINT", "")
+                new_endpoint = st.text_input(
+                    "Endpoint do Astra DB:",
+                    value=current_endpoint,
+                    help="URL do endpoint do Astra DB (ex: https://db-id.us-east-1.apps.astra.datastax.com)",
+                    key="db_endpoint_input"
+                )
+                current_token = os.getenv("ASTRA_DB_APPLICATION_TOKEN", "")
+                new_token = st.text_input(
+                    "Token de Aplicação:",
+                    value=current_token,
+                    type="password",
+                    help="Token de autenticação do Astra DB",
+                    key="db_token_input"
+                )
+                if st.form_submit_button("💾 Salvar Configurações", use_container_width=True):
                     try:
-                        # Aqui você testaria a conexão real
+                        if new_endpoint != current_endpoint:
+                            set_env_var("ASTRA_DB_API_ENDPOINT", new_endpoint)
+                            logger.info(f"[CONFIG] Endpoint do Astra DB atualizado")
+                        if new_token != current_token:
+                            set_env_var("ASTRA_DB_APPLICATION_TOKEN", new_token)
+                            logger.info("[CONFIG] Token do Astra DB atualizado")
+                        st.success("✅ Configurações salvas!")
+                    except Exception as e:
+                        st.error(f"❌ Erro ao salvar configurações: {str(e)}")
+                        logger.error(f"[CONFIG] Erro ao salvar configurações: {e}")
+            if st.button("🔗 Testar Conexão", use_container_width=True):
+                try:
+                    from astrapy import DataAPIClient
+                    endpoint = os.getenv("ASTRA_DB_API_ENDPOINT")
+                    token = os.getenv("ASTRA_DB_APPLICATION_TOKEN")
+                    if not endpoint or not token:
+                        st.warning("⚠️ Configure o endpoint e token primeiro")
+                    else:
+                        client = DataAPIClient()
+                        database = client.get_database(endpoint, token=token)
+                        collection = database.get_collection("pdf_documents")
+                        list(collection.find({}, limit=1))
                         st.success("✅ Conexão com Astra DB estabelecida!")
-                    except Exception as e:
-                        st.error(f"❌ Erro de conexão: {e}")
-            
-            with col2:
-                st.markdown("##### 🤖 Configurações de IA")
-                
-                # Informações das APIs (sem revelar chaves)
-                openai_key = os.getenv("OPENAI_API_KEY", "")
-                voyage_key = os.getenv("VOYAGE_API_KEY", "")
-                
-                st.info(f"**OpenAI API:** {'✅ Configurada' if openai_key else '❌ Não configurada'}")
-                st.info(f"**Voyage AI API:** {'✅ Configurada' if voyage_key else '❌ Não configurada'}")
-                
-                # Health check do sistema
-                if st.button("🏥 Health Check", use_container_width=True):
-                    try:
-                        from buscador_conversacional_producao import health_check
-                        health_status = health_check()
-                        
-                        if health_status["status"] == "healthy":
-                            st.success("✅ Sistema operacional")
-                        elif health_status["status"] == "degraded":
-                            st.warning("⚠️ Sistema com degradação")
-                        else:
-                            st.error("❌ Sistema com problemas")
-                        
-                        st.json(health_status)
-                        
-                    except Exception as e:
-                        st.error(f"❌ Erro no health check: {e}")
-            
+                except Exception as e:
+                    st.error(f"❌ Erro de conexão: {e}")
 
 def user_stats_modal():
     """Modal para exibir estatísticas pessoais do usuário"""
@@ -1121,7 +1269,6 @@ def user_stats_modal():
                         value=user_stats.get("successful_answers", 0),
                         help="Perguntas que resultaram em respostas satisfatórias"
                     )
-                
                 
                 with col4:
                     # Taxa de sucesso
@@ -1188,129 +1335,147 @@ def user_stats_modal():
                 logger.error(f"Erro ao exibir estatísticas pessoais: {e}")
                 st.error("❌ Erro ao carregar suas estatísticas. Tente novamente.")
 
+def ia_config_modal():
+    """Modal central para configurações de IA"""
+    if st.session_state.get('show_ia_config', False):
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            st.markdown("# 🤖 Configurações de IA")
+        with col2:
+            if st.button("❌ Fechar", key="close_ia_config", use_container_width=True):
+                st.session_state.show_ia_config = False
+                st.rerun()
+        st.markdown("---")
+        with st.form('ia_api_config_form'):
+            current_openai_key = os.getenv('OPENAI_API_KEY', '')
+            new_openai_key = st.text_input(
+                'OpenAI API Key:',
+                value=current_openai_key,
+                type='password',
+                help='Chave de API da OpenAI para geração de texto',
+                key='openai_key_input'
+            )
+            current_voyage_key = os.getenv('VOYAGE_API_KEY', '')
+            new_voyage_key = st.text_input(
+                'Voyage API Key:',
+                value=current_voyage_key,
+                type='password',
+                help='Chave de API da Voyage AI para embeddings',
+                key='voyage_key_input'
+            )
+            if st.form_submit_button('💾 Salvar Chaves de API', use_container_width=True):
+                try:
+                    if new_openai_key != current_openai_key:
+                        set_env_var('OPENAI_API_KEY', new_openai_key)
+                        logger.info('[CONFIG] OpenAI API Key atualizada')
+                    if new_voyage_key != current_voyage_key:
+                        set_env_var('VOYAGE_API_KEY', new_voyage_key)
+                        logger.info('[CONFIG] Voyage API Key atualizada')
+                    st.success('✅ Chaves de API salvas!')
+                except Exception as e:
+                    st.error(f'❌ Erro ao salvar chaves: {str(e)}')
+                    logger.error(f'[CONFIG] Erro ao salvar chaves: {e}')
+
+def set_env_var(key: str, value: str, env_path: str = ".env"):
+    """Atualiza ou adiciona uma variável no arquivo .env e no ambiente do processo."""
+    env_file = Path(env_path)
+    lines = []
+    found = False
+    if env_file.exists():
+        with open(env_file, 'r', encoding='utf-8') as f:
+            for line in f:
+                if line.strip().startswith(f"{key}="):
+                    lines.append(f"{key}={value}\n")
+                    found = True
+                else:
+                    lines.append(line)
+    if not found:
+        lines.append(f"{key}={value}\n")
+    with open(env_file, 'w', encoding='utf-8') as f:
+        f.writelines(lines)
+    os.environ[key] = value
+    load_dotenv(override=True)
 
 def chat_interface():
-    """Interface principal de chat otimizada"""
-    st.title("🚀 RAG Conversacional")
-    
-    
-    # Inicializa RAG do usuário se não existir
-    if 'user_rag' not in st.session_state:
-        logger.info(f"[CHAT] Inicializando RAG para usuário: {st.session_state.username}")
-        
-        with st.spinner("Inicializando sistema RAG..."):
-            try:
-                init_start = time.time()
-                
-                st.session_state.user_rag = ProductionStreamlitRAG(st.session_state.username)
-                
-                init_time = time.time() - init_start
-                logger.info(f"[CHAT] RAG do usuário inicializado em {init_time:.2f}s")
-                
-                st.success("✅ Sistema inicializado com sucesso!")
-            except Exception as e:
-                logger.error(f"[CHAT] Erro ao inicializar RAG para {st.session_state.username}: {e}", exc_info=True)
-                st.error(f"❌ Erro na inicialização: {e}")
-                st.stop()
-    
-    # Verifica se algum modal está aberto
-    modal_open = (
+    """Interface de chat robusta e sincronizada"""
+    if not (
         st.session_state.get('show_user_management', False) or
         st.session_state.get('show_user_stats', False) or
-        st.session_state.get('show_document_management', False)
-    )
-    
-    # Se algum modal estiver aberto, mostra apenas o modal
-    if modal_open:
-        # Indicação visual de que está em modo modal
-        st.info("🔄 **Modo Painel:** Use o botão ❌ Fechar no canto superior direito para voltar à conversa.")
+        st.session_state.get('show_document_management', False) or
+        st.session_state.get('show_ia_config', False)
+    ):
+        st.title("🚀 RAG Conversacional")
+    if 'user_rag' not in st.session_state:
+        with st.spinner("Inicializando sistema RAG...", show_time=True):
+            try:
+                st.session_state.user_rag = ProductionStreamlitRAG(st.session_state.username)
+                st.success("✅ Sistema inicializado com sucesso!")
+            except Exception as e:
+                st.error(f"❌ Erro na inicialização: {e}")
+                st.stop()
+    # Carregamento inicial do histórico
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+        try:
+            history = st.session_state.user_rag.get_history()
+            if history:
+                st.session_state.messages = history.copy()
+        except:
+            pass
+    # Exibe histórico acumulado
+    if not st.session_state.messages:
+        user_name = st.session_state.user_info.get('name', 'usuário')
+        st.markdown(f"""
+        👋 Olá, **{user_name}**! Bem-vindo ao sistema RAG.
         
-        user_management_modal()
-        user_stats_modal()
-        document_management_modal()
-        return  # Para aqui, não mostra a conversa
-    
-    # Container para mensagens (só mostra se nenhum modal estiver aberto)
-    chat_container = st.container()
-    
-    # Exibe histórico da conversa
-    with chat_container:
-        history = st.session_state.user_rag.get_history()
+        💡 **Exemplos de perguntas:**
+        - "O que é o Zep Graphiti?"
+        - "Explique a arquitetura temporal"
+        - "Quais são os resultados de performance?"
         
-        if history:
-            for message in history:
-                if message["role"] == "user":
-                    with st.chat_message("user"):
-                        st.write(message["content"])
-                else:
-                    with st.chat_message("assistant"):
-                        st.write(message["content"])
-        else:
-            # Mensagem de boas-vindas personalizada
-            user_name = st.session_state.user_info.get('name', 'usuário')
-            welcome_msg = f"""
-            👋 Olá, **{user_name}**! Bem-vindo ao sistema RAG.
-            
-            🚀 **Recursos disponíveis:**
-            - Perguntas contextuais inteligentes
-            - Memória de conversas anteriores  
-            - Análise de documentos acadêmicos
-            
-            💡 **Exemplos de perguntas:**
-            - "O que é o Zep Graphiti?"
-            - "Explique a arquitetura temporal"
-            - "Quais são os resultados de performance?"
-            - "Como funciona a invalidação de memória?"
-            
-            Faça sua primeira pergunta!
-            """
-            st.markdown(welcome_msg)
-    
+        Faça sua primeira pergunta!
+        """)
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
     # Input para nova mensagem
     if prompt := st.chat_input("Digite sua pergunta..."):
         logger.info(f"[CHAT] Nova mensagem do usuário {st.session_state.username}: {prompt[:100]}...")
-        
-        # Mostra pergunta do usuário
+        # Adiciona mensagem do usuário ao histórico (frontend e backend)
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        if 'rag_instance' in st.session_state and st.session_state.rag_instance:
+            st.session_state.rag_instance.chat_history.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.write(prompt)
-        
-        # Gera resposta usando sistema
         with st.chat_message("assistant"):
-            with st.spinner("🧠 Processando com IA..."):
-                try:
-                    start_time = time.time()
-                    logger.debug(f"[CHAT] Iniciando processamento da pergunta...")
-                    
-                    response = st.session_state.user_rag.ask(prompt)
-                    processing_time = time.time() - start_time
-                    
-                    logger.info(f"[CHAT] Resposta processada em {processing_time:.2f}s para {st.session_state.username}")
-                    logger.debug(f"[CHAT] Resposta: {response[:200]}...")
-                    
-                    st.write(response)
-                    
-                    # Mostra tempo de processamento para admin
-                    if st.session_state.user_info.get('role') == 'Admin':
-                        st.caption(f"⏱️ Processado em {processing_time:.2f}s")
-                        logger.debug(f"[CHAT] Tempo mostrado para admin: {processing_time:.2f}s")
-                        
-                except Exception as e:
-                    error_time = time.time() - start_time
-                    error_msg = f"❌ Erro ao processar pergunta: {e}"
-                    
-                    logger.error(f"[CHAT] Erro no chat para {st.session_state.username} após {error_time:.2f}s: {e}", exc_info=True)
-                    
-                    st.error(error_msg)
-                    
-                    # Fallback para admin
-                    if st.session_state.user_info.get('role') == 'Admin':
-                        logger.debug(f"[CHAT] Mostrando debug info para admin")
-                        st.markdown("**Debug Info:**")
-                        st.code(str(e))
+            start_time = time.time()
+            try:
+                with st.spinner("🧠 Processando com IA...", show_time=True):
+                    resposta = st.session_state.user_rag._ask_without_history_update(prompt)
+                processing_time = time.time() - start_time
+                logger.info(f"[CHAT] Resposta processada em {processing_time:.2f}s para {st.session_state.username}")
+                logger.debug(f"[CHAT] Resposta: {resposta[:200]}...")
+                st.write(resposta)
+                # Adiciona resposta ao histórico (frontend e backend)
+                st.session_state.messages.append({"role": "assistant", "content": resposta})
+                if 'rag_instance' in st.session_state and st.session_state.rag_instance:
+                    st.session_state.rag_instance.chat_history.append({"role": "assistant", "content": resposta})
+                st.session_state.user_rag.save_user_history()
+                if st.session_state.user_info.get('role') == 'Admin':
+                    st.caption(f"⏱️ Processado em {processing_time:.2f}s")
+                    logger.debug(f"[CHAT] Tempo mostrado para admin: {processing_time:.2f}s")
+            except Exception as e:
+                error_time = time.time() - start_time
+                error_msg = f"❌ Erro ao processar pergunta: {e}"
+                logger.error(f"[CHAT] Erro no chat para {st.session_state.username} após {error_time:.2f}s: {e}", exc_info=True)
+                st.error(error_msg)
+                st.session_state.messages.append({"role": "assistant", "content": error_msg})
+                if 'rag_instance' in st.session_state and st.session_state.rag_instance:
+                    st.session_state.rag_instance.chat_history.append({"role": "assistant", "content": error_msg})
+                st.session_state.user_rag.save_user_history()
 
 def main():
     """Função principal da aplicação"""
-    # CSS personalizado para melhor aparência
     st.markdown("""
     <style>
     .stApp > header {
@@ -1321,17 +1486,28 @@ def main():
     }
     </style>
     """, unsafe_allow_html=True)
-    
-    # Inicializa estado da sessão
+
     if 'authenticated' not in st.session_state:
         st.session_state.authenticated = False
-    
-    # Verifica autenticação
+
     if not st.session_state.authenticated:
         login_page()
     else:
-        # Interface principal
         sidebar_user_info()
+        # Exibe o modal/tela correta conforme o estado
+        if st.session_state.get('show_user_management', False):
+            user_management_modal()
+            return
+        if st.session_state.get('show_user_stats', False):
+            user_stats_modal()
+            return
+        if st.session_state.get('show_document_management', False):
+            document_management_modal()
+            return
+        if st.session_state.get('show_ia_config', False):
+            ia_config_modal()
+            return
+        # Se nenhum modal, exibe o chat
         chat_interface()
 
 if __name__ == "__main__":

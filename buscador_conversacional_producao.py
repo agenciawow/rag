@@ -421,28 +421,21 @@ class ProductionConversationalRAG:
         """Interface conversacional principal otimizada"""
         import time
         start_time = time.time()
-        
         logger.info(f"[ASK] === INICIANDO PROCESSAMENTO ===")
         logger.info(f"[ASK] Pergunta do usuário: {user_message}")
-        
         try:
             # Adiciona mensagem do usuário ao histórico
             self.chat_history.append({"role": "user", "content": user_message})
             logger.debug(f"[ASK] Mensagem adicionada ao histórico. Total: {len(self.chat_history)} mensagens")
-            
             # Transforma em query RAG
             logger.info(f"[ASK] 🔄 ETAPA 1: Transformando query com IA...")
             transform_start = time.time()
-            
             transformed_query = self.query_transformer.transform_query(self.chat_history)
-            
             transform_time = time.time() - transform_start
             logger.info(f"[ASK] ✅ Query transformada em {transform_time:.2f}s: '{transformed_query}'")
-            
             # Verifica se precisa fazer RAG
             needs_rag = self.query_transformer.needs_rag(transformed_query)
             logger.info(f"[ASK] 🤔 ETAPA 2: Precisa fazer RAG? {needs_rag}")
-            
             if not needs_rag:
                 logger.info(f"[ASK] 💬 Gerando resposta conversacional simples...")
                 response = self._generate_non_rag_response(user_message)
@@ -452,11 +445,9 @@ class ProductionConversationalRAG:
                 clean_query = self.query_transformer.clean_query(transformed_query)
                 logger.info(f"[ASK] 🧹 Query limpa: '{clean_query}'")
                 logger.info(f"[ASK] 🔍 ETAPA 3: Iniciando busca RAG...")
-                
                 rag_start = time.time()
                 rag_result = self.search_and_answer(clean_query)
                 rag_time = time.time() - rag_start
-                
                 if "error" in rag_result:
                     logger.warning(f"[ASK] ❌ RAG retornou erro em {rag_time:.2f}s: {rag_result['error']}")
                     response = f"Desculpe, não consegui encontrar informações sobre isso. {rag_result['error']}"
@@ -465,22 +456,17 @@ class ProductionConversationalRAG:
                     logger.info(f"[ASK] 📊 Páginas selecionadas: {rag_result.get('selected_pages_count', 0)}")
                     logger.info(f"[ASK] 📚 Fonte: {rag_result.get('selected_pages', 'N/A')}")
                     response = rag_result["answer"]
-            
-            # Adiciona resposta ao histórico
-            self.chat_history.append({"role": "assistant", "content": response})
-            logger.debug(f"[ASK] Resposta adicionada ao histórico")
-            
+            # NÃO adicionar resposta ao histórico aqui!
+            # self.chat_history.append({"role": "assistant", "content": response})
+            logger.debug(f"[ASK] Resposta gerada, mas não adicionada ao histórico (frontend faz isso)")
             # Limita histórico para controle de memória
             if len(self.chat_history) > 20:
                 old_len = len(self.chat_history)
                 self.chat_history = self.chat_history[-16:]
                 logger.debug(f"[ASK] Histórico limitado: {old_len} -> {len(self.chat_history)} mensagens")
-            
             total_time = time.time() - start_time
             logger.info(f"[ASK] ✅ === PROCESSAMENTO COMPLETO em {total_time:.2f}s ===")
-            
             return response
-            
         except Exception as e:
             error_time = time.time() - start_time
             logger.error(f"[ASK] ❌ Erro no processamento após {error_time:.2f}s: {e}", exc_info=True)
@@ -1135,6 +1121,42 @@ __all__ = [
     'MultimodalRagSearcher',
     'health_check'
 ]
+
+def test_apis():
+    """
+    Testa a conexão com as APIs de IA (OpenAI e Voyage).
+    Retorna um dicionário com o status de cada API.
+    """
+    status = {
+        "openai": False,
+        "voyage": False
+    }
+    
+    # Testa OpenAI API
+    try:
+        from openai import OpenAI
+        client = OpenAI()
+        # Tenta uma chamada simples
+        client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[{"role": "user", "content": "test"}],
+            max_tokens=5
+        )
+        status["openai"] = True
+    except Exception as e:
+        logger.error(f"[API TEST] Erro ao testar OpenAI API: {e}")
+    
+    # Testa Voyage API
+    try:
+        import voyageai
+        voyageai.api_key = os.getenv("VOYAGE_API_KEY")
+        # Tenta uma chamada simples
+        voyageai.get_embeddings(["test"])
+        status["voyage"] = True
+    except Exception as e:
+        logger.error(f"[API TEST] Erro ao testar Voyage API: {e}")
+    
+    return status
 
 if __name__ == "__main__":
     main()

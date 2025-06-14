@@ -41,9 +41,23 @@ logging.basicConfig(level=logging.INFO,
 logger = logging.getLogger(__name__)
 
 # ───── Helpers ─────
-def create_doc_source_name(url: str) -> str:
-    fn = url.split("/")[-1]
-    return re.sub(r"[^a-zA-Z0-9_.-]", "_", os.path.splitext(fn)[0])
+def create_doc_source_name(pdf_url: str) -> str:
+    """Cria nome único para o documento baseado na URL/caminho"""
+    # Se for um arquivo temporário e tiver o nome original definido
+    if os.path.basename(pdf_url).startswith('temp_') and 'ORIGINAL_FILENAME' in os.environ:
+        return os.environ['ORIGINAL_FILENAME']
+    
+    # Para URLs, usa o nome do arquivo da URL
+    if pdf_url.startswith(('http://', 'https://')):
+        # Extrai nome do arquivo da URL
+        filename = pdf_url.split('/')[-1]
+        # Remove parâmetros de query se existirem
+        filename = filename.split('?')[0]
+        # Remove extensão
+        return os.path.splitext(filename)[0]
+    
+    # Para arquivos locais, usa o nome do arquivo
+    return os.path.splitext(os.path.basename(pdf_url))[0]
 
 def pixel_token_count(img: Image.Image, config: Config) -> int:
     return int((img.width * img.height) * config.TOKENS_PER_PIXEL)
