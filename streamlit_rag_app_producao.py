@@ -8,7 +8,7 @@ import os
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from zoneinfo import ZoneInfo
 import re
 import tempfile
@@ -184,12 +184,15 @@ class ProductionStreamlitRAG:
                 with open(self.memory_file, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                     # Define histórico específico do usuário no RAG
-                    st.session_state.rag_instance.chat_history = data.get("chat_history", [])
+                    chat_history = data.get("chat_history", [])
+                    st.session_state.rag_instance.chat_history = chat_history
+                    logger.info(f"[LOAD] Histórico carregado: {len(chat_history)} mensagens para {self.user_id}")
             except Exception as e:
                 logger.warning(f"Erro ao carregar histórico do usuário {self.user_id}: {e}")
                 st.session_state.rag_instance.chat_history = []
         else:
             st.session_state.rag_instance.chat_history = []
+            logger.info(f"[LOAD] Novo usuário, histórico vazio para {self.user_id}")
         
         # Carrega estatísticas
         self.user_stats = self._load_user_stats()
@@ -220,22 +223,35 @@ class ProductionStreamlitRAG:
             logger.error(f"Erro ao salvar estatísticas: {e}")
     
     def save_user_history(self):
-        """Salva histórico do usuário"""
+        """Salva histórico do usuário de forma sincronizada"""
         try:
+            # Usa o histórico do frontend como fonte da verdade
+            current_history = getattr(st.session_state, 'messages', [])
+            
+            # Se não houver histórico no frontend, usa o do backend
+            if not current_history and hasattr(st.session_state.rag_instance, 'chat_history'):
+                current_history = st.session_state.rag_instance.chat_history
+            
             memory_data = {
                 "user_id": self.user_id,
                 "last_updated": get_sao_paulo_time().isoformat(),
-                "total_messages": len(st.session_state.rag_instance.chat_history),
-                "chat_history": st.session_state.rag_instance.chat_history
+                "total_messages": len(current_history),
+                "chat_history": current_history
             }
             
             with open(self.memory_file, 'w', encoding='utf-8') as f:
                 json.dump(memory_data, f, indent=2, ensure_ascii=False)
             
+            # Sincroniza o histórico do backend com o frontend
+            if hasattr(st.session_state.rag_instance, 'chat_history'):
+                st.session_state.rag_instance.chat_history = current_history.copy()
+            
             self._save_user_stats()
+            logger.debug(f"[SAVE] Histórico salvo: {len(current_history)} mensagens")
+            
         except Exception as e:
             logger.error(f"Erro ao salvar histórico: {e}")
-            st.error(f"Erro ao salvar dados: {e}")
+            # Não exibe erro no Streamlit para evitar inundação de mensagens
     
     def ask(self, question: str) -> str:
         """Faz pergunta usando RAG e salva automaticamente"""
@@ -271,47 +287,72 @@ class ProductionStreamlitRAG:
             logger.error(f"[ASK] Erro na pergunta do usuário {self.user_id} após {error_time:.2f}s: {e}", exc_info=True)
             return f"❌ Erro ao processar pergunta: {e}"
     
-    def _ask_without_history_update(self, question: str) -> str:
-        """Faz pergunta usando RAG SEM atualizar o histórico automaticamente"""
+    def ask_question_only(self, question: str) -> str:
+        """Faz pergunta usando RAG retornando apenas a resposta, sem gerenciar histórico"""
         start_time = time.time()
         
-        logger.info(f"[ASK_NO_HISTORY] Usuário {self.user_id} perguntou: {question[:100]}...")
+        logger.info(f"[ASK_ONLY] Usuário {self.user_id} perguntou: {question[:100]}...")
         
         try:
             self.user_stats["total_questions"] += 1
-            logger.debug(f"[ASK_NO_HISTORY] Total de perguntas do usuário: {self.user_stats['total_questions']}")
+            logger.debug(f"[ASK_ONLY] Total de perguntas do usuário: {self.user_stats['total_questions']}")
             
-            # Salva histórico atual antes da pergunta
-            current_history = st.session_state.rag_instance.chat_history.copy()
+            # Cria uma instância temporária do RAG com o contexto atual
+            temp_history = st.session_state.rag_instance.chat_history.copy()
             
-            # Usa o método ask do sistema (que vai adicionar pergunta e resposta)
-            logger.debug(f"[ASK_NO_HISTORY] Chamando RAG...")
-            response = st.session_state.rag_instance.ask(question)
+            # Adiciona a pergunta temporariamente para contexto
+            temp_history.append({"role": "user", "content": question})
             
-            # Restaura histórico original (remove pergunta e resposta que foram adicionadas automaticamente)
-            st.session_state.rag_instance.chat_history = current_history
+            # Salva o histórico original
+            original_history = st.session_state.rag_instance.chat_history
+            
+            # Define o histórico temporário
+            st.session_state.rag_instance.chat_history = temp_history
+            
+            # Usa o método search_and_answer diretamente (sem adicionar ao histórico)
+            from buscador_conversacional_producao import ProductionQueryTransformer
+            transformer = ProductionQueryTransformer(st.session_state.rag_instance.openai_client)
+            
+            # Transforma a query
+            transformed_query = transformer.transform_query(temp_history)
+            
+            if not transformer.needs_rag(transformed_query):
+                response = self._generate_simple_response(question)
+            else:
+                clean_query = transformer.clean_query(transformed_query)
+                rag_result = st.session_state.rag_instance.search_and_answer(clean_query)
+                
+                if "error" in rag_result:
+                    response = f"Desculpe, não consegui encontrar informações sobre isso. {rag_result['error']}"
+                else:
+                    response = rag_result["answer"]
+            
+            # Restaura o histórico original
+            st.session_state.rag_instance.chat_history = original_history
             
             processing_time = time.time() - start_time
-            logger.info(f"[ASK_NO_HISTORY] Resposta gerada em {processing_time:.2f}s")
+            logger.info(f"[ASK_ONLY] Resposta gerada em {processing_time:.2f}s")
             
-            # Limpa a resposta removendo qualquer mensagem de "Resposta gerada" ou similar
+            # Limpa a resposta
             if isinstance(response, str):
-                # Remove linhas que contenham indicadores de tempo ou status
-                cleaned_response = self._clean_rag_response(response)
-                response = cleaned_response
+                response = self._clean_rag_response(response)
             
+            # Atualiza estatísticas
             if "erro" not in response.lower() and "desculpe" not in response.lower():
                 self.user_stats["successful_answers"] += 1
-                logger.debug(f"[ASK_NO_HISTORY] Resposta bem-sucedida registrada")
+                logger.debug(f"[ASK_ONLY] Resposta bem-sucedida registrada")
             else:
-                logger.warning(f"[ASK_NO_HISTORY] Resposta com possível erro detectado")
+                logger.warning(f"[ASK_ONLY] Resposta com possível erro detectado")
             
-            logger.info(f"[ASK_NO_HISTORY] Processo completo em {time.time() - start_time:.2f}s")
+            # Salva estatísticas (mas não o histórico)
+            self._save_user_stats()
+            
+            logger.info(f"[ASK_ONLY] Processo completo em {time.time() - start_time:.2f}s")
             return response
             
         except Exception as e:
             error_time = time.time() - start_time
-            logger.error(f"[ASK_NO_HISTORY] Erro na pergunta do usuário {self.user_id} após {error_time:.2f}s: {e}", exc_info=True)
+            logger.error(f"[ASK_ONLY] Erro na pergunta do usuário {self.user_id} após {error_time:.2f}s: {e}", exc_info=True)
             return f"❌ Erro ao processar pergunta: {e}"
     
     def _clean_rag_response(self, response: str) -> str:
@@ -354,12 +395,28 @@ class ProductionStreamlitRAG:
         
         return result
 
+    def _generate_simple_response(self, question: str) -> str:
+        """Gera resposta simples para perguntas que não precisam de RAG"""
+        greetings = ["oi", "olá", "hello", "hi", "boa tarde", "bom dia", "boa noite"]
+        
+        if any(greeting in question.lower() for greeting in greetings):
+            return "Olá! Sou seu assistente para consultas sobre documentos acadêmicos. Como posso ajudar você hoje?"
+        
+        thanks = ["obrigado", "obrigada", "thanks", "valeu"]
+        if any(thank in question.lower() for thank in thanks):
+            return "De nada! Fico feliz em ajudar. Há mais alguma coisa que gostaria de saber?"
+        
+        return "Como posso ajudar você com consultas sobre os documentos? Faça uma pergunta específica e eu buscarei as informações relevantes."
+
     def clear_history(self):
         """Limpa histórico do usuário"""
         if hasattr(st.session_state.rag_instance, 'clear_history'):
             st.session_state.rag_instance.clear_history()
-        if hasattr(self, 'save_user_history'):
-            self.save_user_history()
+        self.save_user_history()
+        
+    def get_chat_history(self) -> List[Dict[str, str]]:
+        """Retorna o histórico de chat atual"""
+        return st.session_state.rag_instance.chat_history.copy() if hasattr(st.session_state.rag_instance, 'chat_history') else []
 
     def get_user_stats(self):
         """Retorna estatísticas do usuário, sempre garantindo estrutura válida"""
@@ -456,10 +513,18 @@ def sidebar_user_info():
             st.rerun()
 
         if st.button("🧹 Limpar Conversa", key="btn_clear", use_container_width=True):
+            # Limpa histórico do frontend
             st.session_state.messages = []
+            
+            # Limpa histórico do backend
             if 'user_rag' in st.session_state:
                 st.session_state.user_rag.clear_history()
-                st.session_state.user_rag.save_user_history()
+            
+            # Limpa histórico da instância RAG
+            if hasattr(st.session_state, 'rag_instance') and st.session_state.rag_instance:
+                st.session_state.rag_instance.chat_history = []
+                
+            logger.info(f"[CHAT] Histórico limpo para {st.session_state.username}")
             st.success("✅ Conversa limpa!")
             st.rerun()
 
@@ -1397,7 +1462,7 @@ def set_env_var(key: str, value: str, env_path: str = ".env"):
     load_dotenv(override=True)
 
 def chat_interface():
-    """Interface de chat robusta e sincronizada"""
+    """Interface de chat com sincronização corrigida"""
     if not (
         st.session_state.get('show_user_management', False) or
         st.session_state.get('show_user_stats', False) or
@@ -1405,6 +1470,8 @@ def chat_interface():
         st.session_state.get('show_ia_config', False)
     ):
         st.title("🚀 RAG Conversacional")
+    
+    # Inicialização do sistema RAG
     if 'user_rag' not in st.session_state:
         with st.spinner("Inicializando sistema RAG...", show_time=True):
             try:
@@ -1413,16 +1480,19 @@ def chat_interface():
             except Exception as e:
                 st.error(f"❌ Erro na inicialização: {e}")
                 st.stop()
-    # Carregamento inicial do histórico
+    
+    # Carregamento inicial do histórico (apenas uma vez)
     if "messages" not in st.session_state:
-        st.session_state.messages = []
         try:
-            history = st.session_state.user_rag.get_history()
-            if history:
-                st.session_state.messages = history.copy()
-        except:
-            pass
-    # Exibe histórico acumulado
+            # Carrega histórico salvo do backend
+            history = st.session_state.user_rag.get_chat_history()
+            st.session_state.messages = history.copy() if history else []
+            logger.info(f"[CHAT] Histórico carregado: {len(st.session_state.messages)} mensagens")
+        except Exception as e:
+            logger.warning(f"[CHAT] Erro ao carregar histórico: {e}")
+            st.session_state.messages = []
+    
+    # Mensagem de boas-vindas se não houver histórico
     if not st.session_state.messages:
         user_name = st.session_state.user_info.get('name', 'usuário')
         st.markdown(f"""
@@ -1435,44 +1505,82 @@ def chat_interface():
         
         Faça sua primeira pergunta!
         """)
+    
+    # Exibe histórico existente
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
+    
     # Input para nova mensagem
     if prompt := st.chat_input("Digite sua pergunta..."):
         logger.info(f"[CHAT] Nova mensagem do usuário {st.session_state.username}: {prompt[:100]}...")
-        # Adiciona mensagem do usuário ao histórico (frontend e backend)
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        if 'rag_instance' in st.session_state and st.session_state.rag_instance:
-            st.session_state.rag_instance.chat_history.append({"role": "user", "content": prompt})
+        
+        # PASSO 1: Adiciona pergunta do usuário
+        user_message = {"role": "user", "content": prompt}
+        st.session_state.messages.append(user_message)
+        
+        # Adiciona ao backend
+        if hasattr(st.session_state.rag_instance, 'chat_history'):
+            st.session_state.rag_instance.chat_history.append(user_message)
+        
+        # Exibe pergunta do usuário
         with st.chat_message("user"):
-            st.write(prompt)
+            st.markdown(prompt)
+        
+        # PASSO 2: Processa resposta
         with st.chat_message("assistant"):
             start_time = time.time()
             try:
                 with st.spinner("🧠 Processando com IA...", show_time=True):
-                    resposta = st.session_state.user_rag._ask_without_history_update(prompt)
+                    # Usa o método que não duplica histórico
+                    resposta = st.session_state.user_rag.ask_question_only(prompt)
+                
                 processing_time = time.time() - start_time
                 logger.info(f"[CHAT] Resposta processada em {processing_time:.2f}s para {st.session_state.username}")
                 logger.debug(f"[CHAT] Resposta: {resposta[:200]}...")
-                st.write(resposta)
-                # Adiciona resposta ao histórico (frontend e backend)
-                st.session_state.messages.append({"role": "assistant", "content": resposta})
-                if 'rag_instance' in st.session_state and st.session_state.rag_instance:
-                    st.session_state.rag_instance.chat_history.append({"role": "assistant", "content": resposta})
-                st.session_state.user_rag.save_user_history()
+                
+                # Exibe resposta
+                st.markdown(resposta)
+                
+                # PASSO 3: Adiciona resposta ao histórico
+                assistant_message = {"role": "assistant", "content": resposta}
+                st.session_state.messages.append(assistant_message)
+                
+                # Adiciona ao backend
+                if hasattr(st.session_state.rag_instance, 'chat_history'):
+                    st.session_state.rag_instance.chat_history.append(assistant_message)
+                
+                # PASSO 4: Salva histórico (apenas uma vez)
+                try:
+                    st.session_state.user_rag.save_user_history()
+                    logger.debug(f"[CHAT] Histórico salvo com {len(st.session_state.messages)} mensagens")
+                except Exception as save_error:
+                    logger.error(f"[CHAT] Erro ao salvar histórico: {save_error}")
+                
+                # Mostra tempo para admins
                 if st.session_state.user_info.get('role') == 'Admin':
                     st.caption(f"⏱️ Processado em {processing_time:.2f}s")
-                    logger.debug(f"[CHAT] Tempo mostrado para admin: {processing_time:.2f}s")
+                    
             except Exception as e:
                 error_time = time.time() - start_time
                 error_msg = f"❌ Erro ao processar pergunta: {e}"
                 logger.error(f"[CHAT] Erro no chat para {st.session_state.username} após {error_time:.2f}s: {e}", exc_info=True)
+                
+                # Exibe erro
                 st.error(error_msg)
-                st.session_state.messages.append({"role": "assistant", "content": error_msg})
-                if 'rag_instance' in st.session_state and st.session_state.rag_instance:
-                    st.session_state.rag_instance.chat_history.append({"role": "assistant", "content": error_msg})
-                st.session_state.user_rag.save_user_history()
+                
+                # Adiciona erro ao histórico
+                error_message = {"role": "assistant", "content": error_msg}
+                st.session_state.messages.append(error_message)
+                
+                if hasattr(st.session_state.rag_instance, 'chat_history'):
+                    st.session_state.rag_instance.chat_history.append(error_message)
+                
+                # Salva histórico mesmo com erro
+                try:
+                    st.session_state.user_rag.save_user_history()
+                except Exception as save_error:
+                    logger.error(f"[CHAT] Erro ao salvar histórico de erro: {save_error}")
 
 def main():
     """Função principal da aplicação"""
