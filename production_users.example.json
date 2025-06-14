@@ -1,23 +1,10 @@
 {
-  "adminuser": {
-    "password_hash": "examplehash123",
-    "name": "Admin User",
+  "ilceccato88": {
+    "password_hash": "27e2e8b121fa1ff4dfd6c666c85c9dc9bd93f8f3c43840e01a9e8b1ed60bf23f",
+    "name": "Ivan",
     "role": "Admin",
-    "organization": "Example Corp",
-    "created_at": "2025-01-01T00:00:00",
-    "last_login": "",
-    "total_conversations": 0,
-    "successful_queries": 0,
-    "failed_queries": 0,
-    "active": true,
-    "notes": ""
-  },
-  "regularuser": {
-    "password_hash": "examplehash456",
-    "name": "Regular User",
-    "role": "Usuário",
-    "organization": "Example Corp",
-    "created_at": "2025-01-02T00:00:00",
+    "organization": "Agência WOW",
+    "created_at": "2025-06-13T17:49:19.387235",
     "last_login": "",
     "total_conversations": 0,
     "successful_queries": 0,
