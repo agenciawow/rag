@@ -44,9 +44,7 @@ def run_unit_tests():
 
 def run_integration_tests():
     """Run integration tests."""
-    return run_command("python -m pytest tests/integration/ -v -m 'not slow'", "Running integration tests")
-
-def run_all_tests():
+    return run_command("python -m pytest tests/integration/ -v -m 'not slow'", "Running integration tests")tidef run_all_tests():
     """Run all tests."""
     return run_command("python -m pytest tests/ -v", "Running all tests")
 
@@ -66,8 +64,8 @@ def run_linting():
         print("⚠️  Ruff not available, skipping linting")
     
     return success
-
-def main():
+    
+    def main():
     """Main test runner."""
     print("🚀 Multimodal RAG Agents - Test Suite")
     print("=" * 60)
@@ -111,6 +109,20 @@ def main():
         sys.exit(1)
     
     # Final summary
+    print(f"\n{'='*60}")
+    if success:
+        print("🎉 All tests completed successfully!")
+        print("💡 System is ready for deployment")
+    else:
+        print("❌ Some tests failed")
+        print("🔧 Please review the errors above and fix issues")
+    print(f"{'='*60}\n")
+    
+    sys.exit(0 if success else 1)
+
+
+if __name__ == "__main__":
+    main()eady for # Final summary
     print(f"\n{'='*60}")
     if success:
         print("🎉 All tests completed successfully!")

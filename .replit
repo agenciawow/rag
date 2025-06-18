@@ -3,3 +3,15 @@ modules = ["python-3.12"]
 [nix]
 channel = "stable-24_05"
 packages = ["freetype", "gumbo", "harfbuzz", "jbig2dec", "lcms2", "libimagequant", "libjpeg", "libjpeg_turbo", "libtiff", "libwebp", "libxcrypt", "mupdf", "openjpeg", "swig", "tcl", "tk", "xcbuild", "zlib"]
+
+[workflows]
+runButton = "Run Tests"
+
+[[workflows.workflow]]
+name = "Run Tests"
+author = 38384792
+mode = "sequential"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "cd multimodal-rag-agents && python run_tests.py quick"

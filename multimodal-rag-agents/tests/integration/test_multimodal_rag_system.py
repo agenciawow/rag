@@ -24,7 +24,7 @@ from rag_agents.models.rag_models import (
 @pytest.mark.integration
 class TestMultimodalRAGSystem:
     """Integration tests for the complete RAG system."""
-    
+
     @pytest.fixture
     def mock_environment(self):
         """Mock environment with API keys."""
@@ -34,7 +34,7 @@ class TestMultimodalRAGSystem:
             "ASTRA_DB_API_ENDPOINT": "https://test.astra.datastax.com",
             "ASTRA_DB_APPLICATION_TOKEN": "AstraCS:test_token"
         }
-    
+
     @pytest.fixture
     def agent_configs(self, mock_environment):
         """Create configurations for all agents."""
@@ -58,7 +58,7 @@ class TestMultimodalRAGSystem:
                 openai_api_key=mock_environment["OPENAI_API_KEY"]
             )
         }
-    
+
     @pytest.fixture
     def test_context(self):
         """Create test context for queries."""
@@ -71,7 +71,7 @@ class TestMultimodalRAGSystem:
                 "Explain component interactions"
             ]
         )
-    
+
     @pytest.mark.asyncio
     @patch('rag_agents.agents.retriever.voyageai.Client')
     @patch('rag_agents.agents.retriever.DataAPIClient')
@@ -85,20 +85,22 @@ class TestMultimodalRAGSystem:
         mock_astra, mock_voyage, agent_configs, test_context
     ):
         """Test complete RAG pipeline with mocked external services."""
-        
+
         # Mock Voyage AI embeddings
         mock_voyage_client = Mock()
         mock_voyage.return_value = mock_voyage_client
         mock_voyage_client.multimodal_embed.return_value = Mock(
             embeddings=[[0.1, 0.2, 0.3, 0.4, 0.5] * 200]  # 1000-dim embedding
         )
-        
+
         # Mock Astra DB documents
         mock_astra_client = Mock()
         mock_astra.return_value = mock_astra_client
+        mock_database = Mock()
         mock_collection = Mock()
-        mock_astra_client.get_collection.return_value = mock_collection
-        
+        mock_astra_client.get_database.return_value = mock_database
+        mock_database.get_collection.return_value = mock_collection
+
         mock_documents = [
             {
                 "_id": "zep_arch_001",
@@ -134,11 +136,11 @@ class TestMultimodalRAGSystem:
                 "$similarity": 0.85
             }
         ]
-        
+
         mock_collection.find = AsyncMock(return_value=mock_documents)
-        
+
         # Mock all LLM responses using Instructor
-        
+
         # Lead agent decomposition
         from rag_agents.models.rag_models import RAGDecomposition, SearchStrategy, RankingCriterion
         mock_decomposition = RAGDecomposition(
@@ -172,11 +174,11 @@ class TestMultimodalRAGSystem:
             visual_requirements=["architecture_diagrams", "component_flows", "system_overview"],
             response_format="detailed"
         )
-        
+
         mock_lead_client = Mock()
         mock_lead_instructor.return_value = mock_lead_client
         mock_lead_client.chat.completions.create = AsyncMock(return_value=mock_decomposition)
-        
+
         # Reranker response
         mock_rerank_response = RankedDocuments(
             documents=[
@@ -217,11 +219,11 @@ class TestMultimodalRAGSystem:
             total_candidates_processed=3,
             selection_strategy_used="technical_relevance_with_visual_priority"
         )
-        
+
         mock_rerank_client = Mock()
         mock_rerank_instructor.return_value = mock_rerank_client
         mock_rerank_client.chat.completions.create = AsyncMock(return_value=mock_rerank_response)
-        
+
         # Context analyzer response
         mock_context_analysis = ContextAnalysis(
             completeness_score=0.85,
@@ -231,11 +233,11 @@ class TestMultimodalRAGSystem:
             visual_coverage=0.67,
             recommended_action="proceed"
         )
-        
+
         mock_context_client = Mock()
         mock_context_instructor.return_value = mock_context_client
         mock_context_client.chat.completions.create = AsyncMock(return_value=mock_context_analysis)
-        
+
         # Answer generator response
         from rag_agents.models.rag_models import SourceCitation
         mock_structured_answer = StructuredAnswer(
@@ -281,32 +283,32 @@ These components integrate seamlessly - the Memory Store captures and organizes 
                 "Check integration examples and best practices"
             ]
         )
-        
+
         mock_answer_client = Mock()
         mock_answer_instructor.return_value = mock_answer_client
         mock_answer_client.chat.completions.create = AsyncMock(return_value=mock_structured_answer)
-        
+
         # Create all agents
         retriever = MultimodalRetrieverAgent(
             config=agent_configs['retriever'],
             name="TestRetriever"
         )
-        
+
         reranker = MultimodalRerankerAgent(
             config=agent_configs['reranker'],
             name="TestReranker"
         )
-        
+
         context_analyzer = ContextAnalyzerAgent(
             config=agent_configs['context_analyzer'],
             name="TestContextAnalyzer"
         )
-        
+
         answer_generator = MultimodalAnswerAgent(
             config=agent_configs['answer_generator'],
             name="TestAnswerGenerator"
         )
-        
+
         lead_agent = LeadRAGAgent(
             retriever_agent=retriever,
             reranker_agent=reranker,
@@ -315,31 +317,31 @@ These components integrate seamlessly - the Memory Store captures and organizes 
             config=agent_configs['lead'],
             name="TestLeadRAG"
         )
-        
+
         # Execute full RAG pipeline
         result = await lead_agent.run(test_context)
-        
+
         # Verify successful execution
         assert result.status == AgentState.COMPLETED
         assert isinstance(result.output, RAGResult)
-        
+
         rag_result = result.output
-        
+
         # Verify query decomposition
         assert rag_result.query_decomposition.query_type == "analytical"
         assert "memory_store" in rag_result.query_decomposition.key_aspects
         assert len(rag_result.query_decomposition.search_strategies) == 1
-        
+
         # Verify document retrieval and ranking
         assert len(rag_result.ranked_documents.documents) == 3
         assert rag_result.ranked_documents.documents[0].doc_id == "zep_arch_001"
         assert rag_result.ranked_documents.ranking_analysis.diversity_score == 0.78
-        
+
         # Verify context analysis
         assert rag_result.context_analysis.completeness_score == 0.85
         assert rag_result.context_analysis.confidence_level == "high"
         assert rag_result.context_analysis.recommended_action == "proceed"
-        
+
         # Verify answer generation
         assert "Memory Store" in rag_result.answer.main_response
         assert "Vector Store" in rag_result.answer.main_response
@@ -347,16 +349,16 @@ These components integrate seamlessly - the Memory Store captures and organizes 
         assert len(rag_result.answer.sources_used) == 3
         assert rag_result.answer.multimodal_confidence == 0.87
         assert rag_result.answer.evidence_strength == "high"
-        
+
         # Verify processing metadata
         assert len(rag_result.processing_steps) >= 4  # At least 4 agent steps
         assert rag_result.total_tokens_used > 0
         assert rag_result.total_processing_time > 0
-        
+
         # Verify visual elements
         assert "architecture_diagram" in rag_result.answer.visual_elements_used
         assert rag_result.context_analysis.visual_coverage > 0.5
-    
+
     @pytest.mark.asyncio
     @patch('rag_agents.agents.retriever.voyageai.Client')
     @patch('rag_agents.agents.retriever.DataAPIClient')
@@ -368,44 +370,46 @@ These components integrate seamlessly - the Memory Store captures and organizes 
         mock_voyage_client.multimodal_embed.return_value = Mock(
             embeddings=[[0.1, 0.2, 0.3] * 333]  # 999-dim embedding
         )
-        
+
         mock_astra_client = Mock()
         mock_astra.return_value = mock_astra_client
+        mock_database = Mock()
         mock_collection = Mock()
-        mock_astra_client.get_collection.return_value = mock_collection
+        mock_astra_client.get_database.return_value = mock_database
+        mock_database.get_collection.return_value = mock_collection
         mock_collection.find = AsyncMock(return_value=[])  # No documents
-        
+
         # Create retriever agent
         retriever = MultimodalRetrieverAgent(
             config=agent_configs['retriever'],
             name="EmptyRetriever"
         )
-        
+
         # Run retriever
         result = await retriever.run(test_context)
-        
+
         assert result.status == AgentState.COMPLETED
         assert isinstance(result.output, list)
         assert len(result.output) == 0
-    
+
     @pytest.mark.asyncio
     async def test_agent_coordination_timing(self, agent_configs, test_context):
         """Test that agents execute in proper sequence and timing."""
         import time
-        
+
         # Create mock agents that track execution order
         execution_order = []
-        
+
         class TimedMockAgent:
             def __init__(self, name, delay=0.1):
                 self.name = name
                 self.delay = delay
-                
+
             async def run(self, context):
                 execution_order.append(f"{self.name}_start")
                 await asyncio.sleep(self.delay)
                 execution_order.append(f"{self.name}_end")
-                
+
                 result = Mock()
                 result.status = AgentState.COMPLETED
                 result.output = f"{self.name}_output"
@@ -414,11 +418,11 @@ These components integrate seamlessly - the Memory Store captures and organizes 
                 result.tokens_used = 50
                 result.error = None
                 return result
-        
+
         # Mock lead agent decomposition
         with patch('rag_agents.agents.lead_rag.instructor.from_openai') as mock_instructor:
             from rag_agents.models.rag_models import RAGDecomposition, SearchStrategy
-            
+
             mock_decomposition = RAGDecomposition(
                 query_type="factual",
                 key_aspects=["test"],
@@ -427,17 +431,17 @@ These components integrate seamlessly - the Memory Store captures and organizes 
                 visual_requirements=[],
                 response_format="detailed"
             )
-            
+
             mock_client = Mock()
             mock_instructor.return_value = mock_client
             mock_client.chat.completions.create = AsyncMock(return_value=mock_decomposition)
-            
+
             # Create timed mock agents
             retriever = TimedMockAgent("Retriever", 0.1)
             reranker = TimedMockAgent("Reranker", 0.05)
             context_analyzer = TimedMockAgent("ContextAnalyzer", 0.05)
             answer_generator = TimedMockAgent("AnswerGenerator", 0.1)
-            
+
             lead_agent = LeadRAGAgent(
                 retriever_agent=retriever,
                 reranker_agent=reranker,
@@ -446,39 +450,39 @@ These components integrate seamlessly - the Memory Store captures and organizes 
                 config=agent_configs['lead'],
                 name="TimingTestLead"
             )
-            
+
             start_time = time.time()
             result = await lead_agent.run(test_context)
             end_time = time.time()
-            
+
             # Verify execution completed
             assert result.status == AgentState.COMPLETED
-            
+
             # Verify sequential execution order
             assert "Retriever_start" in execution_order
             assert "Retriever_end" in execution_order
             assert "Reranker_start" in execution_order
             assert "Reranker_end" in execution_order
-            
+
             # Verify retriever completes before reranker starts
             retriever_end_idx = execution_order.index("Retriever_end")
             reranker_start_idx = execution_order.index("Reranker_start")
             assert retriever_end_idx < reranker_start_idx
-            
+
             # Verify reasonable total execution time
             total_time = end_time - start_time
             assert total_time > 0.25  # At least sum of agent delays
             assert total_time < 2.0   # But not too long
-    
+
     @pytest.mark.asyncio
     async def test_error_propagation(self, agent_configs, test_context):
         """Test error handling and propagation through the system."""
-        
+
         # Create failing retriever
         class FailingRetriever:
             def __init__(self):
                 self.name = "FailingRetriever"
-                
+
             async def run(self, context):
                 result = Mock()
                 result.status = AgentState.FAILED
@@ -488,12 +492,12 @@ These components integrate seamlessly - the Memory Store captures and organizes 
                 result.processing_steps = []
                 result.tokens_used = 0
                 return result
-        
+
         # Create normal mock agents for others
         class NormalMockAgent:
             def __init__(self, name):
                 self.name = name
-                
+
             async def run(self, context):
                 result = Mock()
                 result.status = AgentState.COMPLETED
@@ -503,15 +507,15 @@ These components integrate seamlessly - the Memory Store captures and organizes 
                 result.tokens_used = 50
                 result.error = None
                 return result
-        
+
         failing_retriever = FailingRetriever()
         normal_reranker = NormalMockAgent("Reranker")
         normal_context_analyzer = NormalMockAgent("ContextAnalyzer")
         normal_answer_generator = NormalMockAgent("AnswerGenerator")
-        
+
         with patch('rag_agents.agents.lead_rag.instructor.from_openai') as mock_instructor:
             from rag_agents.models.rag_models import RAGDecomposition, SearchStrategy
-            
+
             mock_decomposition = RAGDecomposition(
                 query_type="factual",
                 key_aspects=["test"],
@@ -520,11 +524,11 @@ These components integrate seamlessly - the Memory Store captures and organizes 
                 visual_requirements=[],
                 response_format="detailed"
             )
-            
+
             mock_client = Mock()
             mock_instructor.return_value = mock_client
             mock_client.chat.completions.create = AsyncMock(return_value=mock_decomposition)
-            
+
             lead_agent = LeadRAGAgent(
                 retriever_agent=failing_retriever,
                 reranker_agent=normal_reranker,
@@ -533,26 +537,26 @@ These components integrate seamlessly - the Memory Store captures and organizes 
                 config=agent_configs['lead'],
                 name="ErrorTestLead"
             )
-            
+
             result = await lead_agent.run(test_context)
-            
+
             # Should fail due to retriever failure
             assert result.status == AgentState.FAILED
             assert "Database connection failed" in result.error
-    
+
     @pytest.mark.asyncio
     async def test_concurrent_agent_operations(self, agent_configs):
         """Test concurrent execution of multiple independent RAG queries."""
-        
+
         class FastMockAgent:
             def __init__(self, name, base_delay=0.01):
                 self.name = name
                 self.base_delay = base_delay
-                
+
             async def run(self, context):
                 # Small random delay to simulate real processing
                 await asyncio.sleep(self.base_delay)
-                
+
                 result = Mock()
                 result.status = AgentState.COMPLETED
                 result.output = f"{self.name}_result_for_{context.query[:10]}"
@@ -561,20 +565,20 @@ These components integrate seamlessly - the Memory Store captures and organizes 
                 result.tokens_used = 25
                 result.error = None
                 return result
-        
+
         # Create contexts for multiple queries
         contexts = [
             AgentContext(query="Query 1", objective="Objective 1"),
             AgentContext(query="Query 2", objective="Objective 2"),
             AgentContext(query="Query 3", objective="Objective 3"),
         ]
-        
+
         # Create lead agents for each query
         lead_agents = []
-        
+
         with patch('rag_agents.agents.lead_rag.instructor.from_openai') as mock_instructor:
             from rag_agents.models.rag_models import RAGDecomposition, SearchStrategy
-            
+
             mock_decomposition = RAGDecomposition(
                 query_type="factual",
                 key_aspects=["test"],
@@ -583,11 +587,11 @@ These components integrate seamlessly - the Memory Store captures and organizes 
                 visual_requirements=[],
                 response_format="detailed"
             )
-            
+
             mock_client = Mock()
             mock_instructor.return_value = mock_client
             mock_client.chat.completions.create = AsyncMock(return_value=mock_decomposition)
-            
+
             for i in range(3):
                 lead_agent = LeadRAGAgent(
                     retriever_agent=FastMockAgent(f"Retriever{i}"),
@@ -598,19 +602,19 @@ These components integrate seamlessly - the Memory Store captures and organizes 
                     name=f"ConcurrentLead{i}"
                 )
                 lead_agents.append(lead_agent)
-            
+
             # Execute all queries concurrently
             start_time = time.time()
             results = await asyncio.gather(*[
                 agent.run(context) for agent, context in zip(lead_agents, contexts)
             ])
             end_time = time.time()
-            
+
             # Verify all completed successfully
             assert len(results) == 3
             for result in results:
                 assert result.status == AgentState.COMPLETED
-            
+
             # Concurrent execution should be faster than sequential
             total_time = end_time - start_time
             assert total_time < 0.5  # Should complete much faster than sequential
