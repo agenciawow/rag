@@ -8,7 +8,7 @@ from unittest.mock import patch, mock_open
 import sys
 
 # Add project root to path
-sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
 from config import EnvConfig, create_default_env_file, get_config, reload_config
 

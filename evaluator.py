@@ -58,17 +58,17 @@ class EvaluationResult:
 
 class RAGEvaluator:
     """Avaliador completo do sistema RAG"""
-    
+
     def __init__(self, rag_searcher: MultimodalRagSearcher):
         """
         Inicializa o avaliador
-        
+
         Args:
             rag_searcher: Instância do MultimodalRagSearcher real.
         """
         self.rag_searcher = rag_searcher
         self.results: List[EvaluationResult] = []
-        
+
     def create_test_dataset(self) -> List[TestQuestion]:
         """
         Cria dataset de teste personalizado para o paper "ZEP: A TEMPORAL KNOWLEDGE GRAPH ARCHITECTURE FOR AGENT MEMORY"
@@ -99,7 +99,7 @@ class RAGEvaluator:
                 category="technical",
                 difficulty="medium"
             ),
-            
+
             # Perguntas conceituais
             TestQuestion(
                 id="concept_001",
@@ -117,7 +117,7 @@ class RAGEvaluator:
                 category="conceptual",
                 difficulty="medium"
             ),
-            
+
             # Perguntas específicas (dados, tabelas)
             TestQuestion(
                 id="specific_001",
@@ -143,7 +143,7 @@ class RAGEvaluator:
                 category="specific",
                 difficulty="hard"
             ),
-            
+
             # Perguntas sobre conteúdo visual (tabelas, pois não há figuras)
             TestQuestion(
                 id="visual_001",
@@ -153,7 +153,7 @@ class RAGEvaluator:
                 category="visual",
                 difficulty="medium"
             ),
-            
+
             # Perguntas que podem não ter resposta clara (negativas)
             TestQuestion(
                 id="negative_001",
@@ -164,7 +164,7 @@ class RAGEvaluator:
                 difficulty="easy"
             ),
         ]
-    
+
     def calculate_metrics(self, 
                           selected_pages: List[int], 
                           expected_pages: List[int],
@@ -178,36 +178,36 @@ class RAGEvaluator:
                 return 1.0, 1.0, 1.0, 1.0, 1.0  # Acerto: não retornou nada quando não devia
             else:
                 return 0.0, 0.0, 0.0, 0.0, 0.0  # Erro: retornou algo quando não devia
-        
+
         if not selected_pages:
-            return 0.0, 0.0, 0.0, 0.0, 0.0 # Erro: não retornou nada quando devia
+            return 0.0, 0.0, 0.0, 0.0, 0.0  # No results when should have results
 
         relevant_selected_set = set(selected_pages) & set(expected_pages)
-        
+
         precision = len(relevant_selected_set) / len(selected_pages)
         recall = len(relevant_selected_set) / len(expected_pages)
-        
+
         if precision + recall == 0:
             f1_score = 0.0
         else:
             f1_score = 2 * (precision * recall) / (precision + recall)
-        
+
         union_set = set(selected_pages) | set(expected_pages)
         page_accuracy = len(relevant_selected_set) / len(union_set) if union_set else 1.0
-        
+
         if not expected_keywords:
             keyword_coverage = 1.0
         else:
             answer_lower = answer.lower()
             found_keywords = sum(1 for kw in expected_keywords if kw.lower() in answer_lower)
             keyword_coverage = found_keywords / len(expected_keywords)
-        
+
         return precision, recall, f1_score, page_accuracy, keyword_coverage
-    
+
     def evaluate_single_question(self, test_q: TestQuestion) -> EvaluationResult:
         """Avalia uma única pergunta."""
         start_time = time.time()
-        
+
         try:
             result = self.rag_searcher.search_and_answer(test_q.question)
             response_time = time.time() - start_time
@@ -234,13 +234,13 @@ class RAGEvaluator:
                     keyword_coverage=0.0, total_candidates=0,
                     error=result["error"]
                 )
-            
+
             selected_pages = [p["page_number"] for p in result["selected_pages_details"]]
-            
+
             precision, recall, f1_score, page_accuracy, keyword_coverage = self.calculate_metrics(
                 selected_pages, test_q.expected_pages, result["answer"], test_q.expected_keywords
             )
-            
+
             return EvaluationResult(
                 question_id=test_q.id, question=test_q.question,
                 selected_pages=selected_pages, expected_pages=test_q.expected_pages,
@@ -249,7 +249,7 @@ class RAGEvaluator:
                 page_accuracy=page_accuracy, keyword_coverage=keyword_coverage,
                 total_candidates=result.get("total_candidates", 0)
             )
-            
+
         except Exception as e:
             response_time = time.time() - start_time
             logger.error(f"Erro fatal avaliando pergunta {test_q.id}: {e}", exc_info=True)
@@ -260,26 +260,26 @@ class RAGEvaluator:
                 precision=0.0, recall=0.0, f1_score=0.0, page_accuracy=0.0,
                 keyword_coverage=0.0, total_candidates=0, error=str(e)
             )
-    
+
     def run_evaluation(self, test_questions: Optional[List[TestQuestion]] = None) -> Dict[str, Any]:
         """Executa avaliação completa."""
         if test_questions is None:
             test_questions = self.create_test_dataset()
-        
+
         logger.info(f"Iniciando avaliação com {len(test_questions)} perguntas")
-        
+
         self.results = [self.evaluate_single_question(test_q) for test_q in tqdm(test_questions, desc="Avaliando perguntas")]
-        
+
         for result in self.results:
              logger.info(f"Q_ID:{result.question_id}: P={result.precision:.2f}, R={result.recall:.2f}, "
                         f"F1={result.f1_score:.2f}, T={result.response_time:.2f}s")
 
         successful_results = [r for r in self.results if r.error is None]
-        
+
         if not successful_results:
             logger.error("Nenhuma pergunta foi avaliada com sucesso!")
             return {"error": "Nenhuma avaliação bem-sucedida"}
-        
+
         # Agrega métricas gerais
         overall_metrics = {
             "average_precision": statistics.mean([r.precision for r in successful_results]),
@@ -289,7 +289,7 @@ class RAGEvaluator:
             "average_keyword_coverage": statistics.mean([r.keyword_coverage for r in successful_results]),
             "average_response_time": statistics.mean([r.response_time for r in successful_results]),
         }
-        
+
         # Agrega métricas por categoria
         categories = {q.category for q in test_questions}
         category_stats = {}
@@ -316,19 +316,19 @@ class RAGEvaluator:
             "detailed_results": [asdict(r) for r in self.results],
             "evaluation_timestamp": datetime.now(ZoneInfo("America/Sao_Paulo")).isoformat(),
         }
-        
+
         return report
-    
+
     def save_report(self, report: Dict[str, Any], output_path: str = "rag_evaluation_report.json"):
         """Salva relatório em arquivo JSON."""
         with open(output_path, 'w', encoding='utf-8') as f:
             json.dump(report, f, indent=2, ensure_ascii=False)
         logger.info(f"Relatório JSON salvo em: {output_path}")
-    
+
     def create_detailed_report(self, report: Dict[str, Any]) -> str:
         """Cria relatório detalhado em texto."""
         lines = ["=" * 80, "RELATÓRIO DE AVALIAÇÃO DO SISTEMA RAG MULTIMODAL", "=" * 80, ""]
-        
+
         summary = report["evaluation_summary"]
         lines.extend([
             "📊 RESUMO GERAL:",
@@ -337,7 +337,7 @@ class RAGEvaluator:
             f"• Avaliações com falha: {summary['failed_evaluations']}",
             f"• Taxa de sucesso: {summary['success_rate']:.1%}", ""
         ])
-        
+
         metrics = report["overall_metrics"]
         lines.extend([
             "📈 MÉTRICAS GERAIS:",
@@ -348,7 +348,7 @@ class RAGEvaluator:
             f"• Cobertura de palavras-chave: {metrics['average_keyword_coverage']:.3f}",
             f"• Tempo de resposta médio: {metrics['average_response_time']:.2f}s", ""
         ])
-        
+
         lines.append("🏷️ ANÁLISE POR CATEGORIA:")
         for cat, stats in report["category_breakdown"].items():
             lines.extend([
@@ -359,7 +359,7 @@ class RAGEvaluator:
                 f"  - Tempo médio: {stats['avg_response_time']:.2f}s"
             ])
         lines.append("")
-        
+
         lines.append("📋 RESULTADOS DETALHADOS:")
         for result in report["detailed_results"]:
             lines.append(f"• {result['question_id']}: {result['question']}")
@@ -369,39 +369,39 @@ class RAGEvaluator:
                 lines.append(f"  ✅ Páginas: {result['selected_pages']} (Esperado: {result['expected_pages']})")
                 lines.append(f"     P={result['precision']:.2f}, R={result['recall']:.2f}, F1={result['f1_score']:.2f}")
         lines.append("")
-        
+
         return "\n".join(lines)
 
 def main():
     """Função principal para execução standalone."""
     print("🚀 AVALIADOR DE SISTEMA RAG MULTIMODAL 🚀")
     print("=" * 60)
-    
+
     try:
         print("🔧 Inicializando o sistema RAG real...")
         rag_searcher = MultimodalRagSearcher()
         print("✅ Sistema RAG inicializado com sucesso!")
-        
+
         evaluator = RAGEvaluator(rag_searcher=rag_searcher)
-        
+
         print("\n🔍 Executando avaliação completa...")
         report = evaluator.run_evaluation()
-        
+
         # Salva e imprime relatórios
         evaluator.save_report(report)
-        
+
         detailed_report = evaluator.create_detailed_report(report)
         report_path = "rag_evaluation_detailed.txt"
         with open(report_path, 'w', encoding='utf-8') as f:
             f.write(detailed_report)
         logger.info(f"Relatório detalhado salvo em: {report_path}")
 
-        
+
         print("\n" + detailed_report)
         print("\n✅ Avaliação concluída! Arquivos salvos:")
         print("• rag_evaluation_report.json")
         print("• rag_evaluation_detailed.txt")
-        
+
     except Exception as e:
         print(f"\n❌ Erro fatal durante a execução do avaliador: {e}")
         logger.critical("Erro fatal no main do avaliador", exc_info=True)
